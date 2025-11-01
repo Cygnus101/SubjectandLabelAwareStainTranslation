@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import random
 import sys
 from dataclasses import dataclass
@@ -29,6 +30,13 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 from tqdm.auto import tqdm
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:  # matplotlib optional; plotting disabled if unavailable
+    plt = None
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_ROOT = SCRIPT_DIR.parent
@@ -299,6 +307,112 @@ def load_checkpoint(
 
 
 # ---------------------------------------------------------------------------
+# Metrics Persistence & Plotting
+# ---------------------------------------------------------------------------
+
+
+def persist_training_artifacts(
+    metrics: Sequence[dict[str, float]],
+    output_dir: Path,
+    run_name: str,
+    enable_plot: bool,
+) -> None:
+    if not metrics:
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / f"{run_name}_metrics.json"
+    with metrics_path.open("w", encoding="utf-8") as fp:
+        json.dump(list(metrics), fp, indent=2)
+    logging.info("Saved training metrics to %s", metrics_path)
+
+    if not enable_plot:
+        return
+    if plt is None:
+        logging.warning("matplotlib not available; skipping loss curve plot.")
+        return
+
+    epochs = [entry["epoch"] for entry in metrics]
+    losses = [entry["loss"] for entry in metrics]
+    lrs = [entry["lr"] for entry in metrics]
+
+    fig, ax1 = plt.subplots(figsize=(8, 5), constrained_layout=True)
+    ax1.plot(epochs, losses, marker="o", color="#1f77b4", label="Loss")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("NT-Xent Loss", color="#1f77b4")
+    ax1.tick_params(axis="y", labelcolor="#1f77b4")
+
+    if any(lrs):
+        ax2 = ax1.twinx()
+        ax2.plot(epochs, lrs, linestyle="--", color="#ff7f0e", label="LR")
+        ax2.set_ylabel("Learning Rate", color="#ff7f0e")
+        ax2.tick_params(axis="y", labelcolor="#ff7f0e")
+
+    ax1.set_title(f"SimCLR Training ({run_name})")
+    ax1.grid(True, linestyle="--", alpha=0.3)
+
+    plot_path = output_dir / f"{run_name}_metrics.png"
+    fig.savefig(plot_path, dpi=120)
+    plt.close(fig)
+    logging.info("Saved loss curve plot to %s", plot_path)
+
+
+def load_metrics_history(metrics_path: Path, upto_epoch: Optional[int] = None) -> list[dict[str, float]]:
+    if not metrics_path.exists():
+        return []
+    try:
+        with metrics_path.open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except Exception as exc:
+        logging.warning("Failed to load metrics from %s: %s", metrics_path, exc)
+        return []
+
+    if not isinstance(data, list):
+        logging.warning("Metrics file %s is not a list; ignoring.", metrics_path)
+        return []
+
+    history: list[dict[str, float]] = []
+    for entry in data:
+        if not isinstance(entry, dict) or "epoch" not in entry:
+            continue
+        try:
+            epoch_value = float(entry["epoch"])
+        except (TypeError, ValueError):
+            continue
+        if upto_epoch is not None and epoch_value > upto_epoch:
+            continue
+        history.append(
+            {
+                "epoch": epoch_value,
+                "loss": float(entry.get("loss", 0.0)),
+                "lr": float(entry.get("lr", 0.0)),
+            }
+        )
+
+    history.sort(key=lambda item: item["epoch"])
+    return history
+
+
+def find_latest_checkpoint(output_dir: Path, run_name: str) -> Optional[tuple[Path, int]]:
+    pattern = re.compile(rf"{re.escape(run_name)}_epoch(\\d+)\\.pt$")
+    latest_epoch = -1
+    latest_path: Optional[Path] = None
+    for path in output_dir.glob(f"{run_name}_epoch*.pt"):
+        if "encoder" in path.stem:
+            continue
+        match = pattern.match(path.name)
+        if not match:
+            continue
+        epoch_num = int(match.group(1))
+        if epoch_num > latest_epoch:
+            latest_epoch = epoch_num
+            latest_path = path
+    if latest_path is None:
+        return None
+    return latest_path, latest_epoch
+
+
+# ---------------------------------------------------------------------------
 # Training Loop
 # ---------------------------------------------------------------------------
 
@@ -349,6 +463,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory to store checkpoints")
     parser.add_argument("--run-name", type=str, default="simclr_reticulin", help="Run identifier used in artifact names")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="Directory for training logs")
+    parser.add_argument(
+        "--disable-plot",
+        dest="plot",
+        action="store_false",
+        help="Disable saving a loss curve plot alongside metrics (enabled by default).",
+    )
 
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -386,7 +506,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest="pretrained",
         help="Disable ImageNet initialization (enabled by default)",
     )
-    parser.set_defaults(pretrained=True)
+    parser.set_defaults(pretrained=True, plot=True)
 
     parser.add_argument(
         "--device",
@@ -395,6 +515,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Device specifier (e.g. cuda, cuda:1, mps, cpu). Defaults to CUDA, then MPS, then CPU.",
     )
     parser.add_argument("--resume", type=Path, default=None, help="Path to a checkpoint to resume from")
+    parser.add_argument(
+        "--resume-latest",
+        action="store_true",
+        help="Resume from the most recent checkpoint in --output-dir for this run.",
+    )
     parser.add_argument("--amp", action="store_true", help="Use automatic mixed precision")
 
     args = parser.parse_args(argv)
@@ -467,13 +592,46 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
     scaler = GradScaler(enabled=use_amp)
 
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = args.output_dir / f"{args.run_name}_metrics.json"
+
+    if args.resume_latest and args.resume is not None:
+        logging.warning("Both --resume and --resume-latest specified; proceeding with explicit --resume path %s", args.resume)
+    elif args.resume_latest and args.resume is None:
+        latest = find_latest_checkpoint(args.output_dir, args.run_name)
+        if latest:
+            args.resume, latest_epoch = latest
+            logging.info("Auto-resuming from latest checkpoint %s (epoch %d)", args.resume, latest_epoch)
+        else:
+            logging.info("No checkpoints found in %s to auto-resume from.", args.output_dir)
+
     start_epoch = 0
     if args.resume:
         logging.info("Resuming from %s", args.resume)
         start_epoch = load_checkpoint(args.resume, model, optimizer=optimizer, scaler=scaler)
-        scheduler.last_epoch = start_epoch - 1
+        scheduler.last_epoch = start_epoch - 1 if start_epoch > 0 else -1
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if start_epoch > 0:
+        metrics = load_metrics_history(metrics_path, upto_epoch=start_epoch)
+        if metrics:
+            last_recorded = metrics[-1]["epoch"]
+            if int(last_recorded) != int(start_epoch):
+                logging.warning(
+                    "Metrics file %s latest epoch %.0f does not match checkpoint epoch %d; truncating to resume epoch.",
+                    metrics_path,
+                    last_recorded,
+                    start_epoch,
+                )
+            else:
+                logging.info("Loaded %d historical metrics entries from %s", len(metrics), metrics_path)
+        else:
+            logging.info(
+                "No existing metrics entries found in %s up to epoch %d; starting metrics fresh.",
+                metrics_path,
+                start_epoch,
+            )
+    else:
+        metrics = []
 
     for epoch in range(start_epoch + 1, args.epochs + 1):
         logging.info("Epoch %d/%d", epoch, args.epochs)
@@ -490,7 +648,10 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         lr = scheduler.get_last_lr()[0]
         logging.info("Epoch %d complete | loss=%.4f | lr=%.6f", epoch, avg_loss, lr)
         save_checkpoint(args.output_dir, args.run_name, epoch, model, optimizer, scaler if use_amp else None, scheduler.state_dict())
+        metrics.append({"epoch": float(epoch), "loss": float(avg_loss), "lr": float(lr)})
+        persist_training_artifacts(metrics, args.output_dir, args.run_name, enable_plot=args.plot)
 
+    persist_training_artifacts(metrics, args.output_dir, args.run_name, enable_plot=args.plot)
     logging.info("Training complete. Latest encoder weights stored in %s", args.output_dir)
     logging.info("Log file: %s", log_path)
 
