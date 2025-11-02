@@ -63,7 +63,7 @@ class PatchDataset(Dataset):
                 return candidate
         return None
 
-    def __getitem__(self, idx: int) -> tuple[int, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Optional[tuple[int, torch.Tensor]]:
         row = self.df.iloc[idx]
         patch_rel = row["patch_path"]
 
@@ -73,10 +73,8 @@ class PatchDataset(Dataset):
             if not patch_abs or not patch_abs.exists():
                 attempts += 1
                 if attempts > self.retries:
-                    raise FileNotFoundError(f"Patch not found after {self.retries} retries: {patch_rel}")
-                idx = torch.randint(0, len(self.df), ()).item()
-                row = self.df.iloc[idx]
-                patch_rel = row["patch_path"]
+                    logging.warning("Skipping missing patch after %d retries: %s", self.retries, patch_rel)
+                    return None
                 continue
 
             try:
@@ -86,10 +84,21 @@ class PatchDataset(Dataset):
             except (UnidentifiedImageError, OSError):
                 attempts += 1
                 if attempts > self.retries:
-                    raise
-                idx = torch.randint(0, len(self.df), ()).item()
-                row = self.df.iloc[idx]
-                patch_rel = row["patch_path"]
+                    logging.warning("Skipping unreadable patch after %d retries: %s", self.retries, patch_rel)
+                    return None
+
+
+def collate_skip_missing(
+    batch: Sequence[Optional[tuple[int, torch.Tensor]]],
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    valid = [item for item in batch if item is not None]
+    if not valid:
+        return None
+
+    indices, images = zip(*valid)
+    index_tensor = torch.tensor(indices, dtype=torch.long)
+    image_tensor = torch.stack(images, dim=0)
+    return index_tensor, image_tensor
 
 
 def build_transform(image_size: int) -> T.Compose:
@@ -132,7 +141,10 @@ def load_encoder(
 
 
 def iter_batches(loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-    for indices, images in loader:
+    for batch in loader:
+        if batch is None:
+            continue
+        indices, images = batch
         yield indices, images
 
 
@@ -171,6 +183,7 @@ def run(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         pin_memory=(device.type != "cpu"),
         drop_last=False,
+        collate_fn=collate_skip_missing,
     )
 
     encoder = load_encoder(
@@ -254,6 +267,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     np.random.seed(args.seed)
 
     run(args)
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
