@@ -12,8 +12,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
+from collections import Counter
 from pathlib import Path
-from typing import List, Sequence, Tuple, Optional
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -37,6 +39,21 @@ ensure_project_root_on_syspath()
 PROJECT_ROOT = get_project_root()
 LOG_DIR = PROJECT_ROOT / "outputs" / "logs"
 
+LABEL_PATTERN = re.compile(r"\d+")
+
+
+def _extract_label(value: Any) -> Optional[int]:
+    if pd.isna(value):
+        return None
+    raw = str(value).strip()
+    if raw.lower() in {"", "nan", "none"}:
+        return None
+    match = LABEL_PATTERN.search(raw)
+    if match is None:
+        logging.warning("Unable to parse label value '%s'", raw)
+        return None
+    return int(match.group(0))
+
 
 class SlideBagDataset(Dataset):
     """Dataset returning one bag (slide) of embeddings per item."""
@@ -53,8 +70,15 @@ class SlideBagDataset(Dataset):
             groups = frame.groupby("slide_id")
             self.entries = []
             for slide_id, group in groups:
-                label = int(group["label"].iloc[0])
+                label_value = _extract_label(group["label"].iloc[0])
+                if label_value is None:
+                    logging.warning("Skipping slide_id=%s due to unparseable label '%s'", slide_id, group["label"].iloc[0])
+                    continue
+                label = label_value
                 embed_paths = group["embedding_path"].tolist()
+                if not embed_paths:
+                    logging.warning("Skipping slide_id=%s because no embedding paths are available", slide_id)
+                    continue
                 patch_paths = group["patch_path"].tolist()
                 self.entries.append((slide_id, label, patch_paths, embed_paths))
 
@@ -88,11 +112,10 @@ def train(args: argparse.Namespace) -> None:
     if {"patch_path", "stain_id", "Reticulin Grade", "type"} - set(metadata_df.columns):
         raise ValueError("metadata CSV missing required columns (patch_path, stain_id, Reticulin Grade, type).")
 
-    metadata_df = metadata_df.copy()
+    metadata_df = metadata_df[metadata_df["type"].astype(str).str.lower().str.contains("reticulin")].copy()
     metadata_df["patch_path_norm"] = metadata_df["patch_path"].astype(str).str.replace("\\", "/", regex=False)
-    metadata_df = metadata_df[metadata_df["type"].astype(str).str.lower().str.contains("reticulin")]
     metadata_df = metadata_df.dropna(subset=["Reticulin Grade"])
-    metadata_df["label"] = pd.to_numeric(metadata_df["Reticulin Grade"], errors="coerce")
+    metadata_df["label"] = metadata_df["Reticulin Grade"].apply(_extract_label)
     metadata_df = metadata_df.dropna(subset=["label"])
     metadata_df["label"] = metadata_df["label"].astype(int)
     metadata_df["slide_id"] = metadata_df["stain_id"].astype(str)
@@ -114,20 +137,51 @@ def train(args: argparse.Namespace) -> None:
     df = df[["slide_id", "label", "patch_path", "embedding_path"]]
 
     full_dataset = SlideBagDataset(df)
+    logging.info("Prepared %d slide_id-label pairs", len(full_dataset))
     num_slides = len(full_dataset)
     if num_slides == 0:
         raise ValueError("No slides found in embeddings CSV.")
 
     rng = np.random.default_rng(args.seed)
-    indices = np.arange(num_slides)
-    rng.shuffle(indices)
+    label_to_indices: dict[int, list[int]] = {}
+    for idx, (_, label, _, _) in enumerate(full_dataset.entries):
+        label_to_indices.setdefault(int(label), []).append(idx)
 
-    val_count = int(num_slides * args.val_ratio)
-    val_indices = indices[:val_count]
-    train_indices = indices[val_count:]
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+    train_label_counts: Counter[int] = Counter()
+    val_label_counts: Counter[int] = Counter()
+
+    for label, idx_list in label_to_indices.items():
+        idx_array = np.array(idx_list, dtype=int)
+        rng.shuffle(idx_array)
+        count = len(idx_array)
+        desired_val = int(count * args.val_ratio)
+        if args.val_ratio > 0 and desired_val == 0 and count > 1:
+            desired_val = 1
+        if desired_val >= count:
+            desired_val = max(0, count - 1)
+
+        val_split = idx_array[:desired_val].tolist() if desired_val > 0 else []
+        train_split = idx_array[desired_val:].tolist()
+
+        val_indices.extend(val_split)
+        train_indices.extend(train_split)
+
+        val_label_counts[label] += len(val_split)
+        train_label_counts[label] += len(train_split)
+
+    if not train_indices:
+        raise ValueError("Training split is empty after stratified sampling.")
 
     train_dataset = full_dataset.subset(train_indices)
-    val_dataset = full_dataset.subset(val_indices) if val_count > 0 else None
+    val_dataset = full_dataset.subset(val_indices) if val_indices else None
+
+    logging.info(
+        "Stratified split | train label counts: %s | val label counts: %s",
+        dict(sorted(train_label_counts.items())),
+        dict(sorted(val_label_counts.items())),
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn) if val_dataset else None
@@ -155,12 +209,26 @@ def train(args: argparse.Namespace) -> None:
     best_epoch = 0
     best_state: Optional[dict[str, dict[str, torch.Tensor]]] = None
 
-    def run_epoch(loader: DataLoader, train: bool) -> Tuple[float, float]:
+    checkpoints_dir = PROJECT_ROOT / "outputs" / "checkpoints" / "abmil"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    abmil_last_path = checkpoints_dir / f"{args.run_name}_abmil_last.pt"
+    classifier_last_path = checkpoints_dir / f"{args.run_name}_classifier_last.pt"
+    abmil_best_path = checkpoints_dir / f"{args.run_name}_abmil_best.pt"
+    classifier_best_path = checkpoints_dir / f"{args.run_name}_classifier_best.pt"
+
+    def run_epoch(loader: DataLoader, train: bool) -> Tuple[float, float, List[float], float, float]:
         if loader is None:
-            return float("nan"), float("nan")
+            return (
+                float("nan"),
+                float("nan"),
+                [float("nan")] * args.num_classes,
+                float("nan"),
+                float("nan"),
+            )
         epoch_loss = 0.0
         correct = 0
         total = 0
+        conf_matrix = np.zeros((args.num_classes, args.num_classes), dtype=np.int64)
         if train:
             model.train()
         else:
@@ -184,41 +252,156 @@ def train(args: argparse.Namespace) -> None:
             preds = logits.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
-        return epoch_loss / total if total else float("nan"), correct / total if total else float("nan")
+            labels_np = labels.detach().cpu().numpy()
+            preds_np = preds.detach().cpu().numpy()
+            for true_val, pred_val in zip(labels_np, preds_np):
+                if 0 <= true_val < args.num_classes and 0 <= pred_val < args.num_classes:
+                    conf_matrix[true_val, pred_val] += 1
 
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = run_epoch(train_loader, train=True)
-        val_loss, val_acc = run_epoch(val_loader, train=False) if val_loader else (float("nan"), float("nan"))
+        avg_loss = epoch_loss / total if total else float("nan")
+        overall_acc = correct / total if total else float("nan")
 
-        history.append(
-            {
+        class_total = conf_matrix.sum(axis=1)
+        class_correct = np.diag(conf_matrix)
+        class_acc = [
+            (class_correct[i] / class_total[i]) if class_total[i] else float("nan")
+            for i in range(args.num_classes)
+        ]
+
+        fp = conf_matrix.sum(axis=0) - class_correct
+        fn = class_total - class_correct
+        denom = (2 * class_correct + fp + fn).astype(np.float64)
+        per_class_f1 = np.where(denom > 0, (2 * class_correct) / denom, np.nan)
+        macro_f1 = float(np.nanmean(per_class_f1)) if np.any(~np.isnan(per_class_f1)) else float("nan")
+
+        total_obs = conf_matrix.sum()
+        qwk = float("nan")
+        if total_obs:
+            hist_true = class_total.astype(np.float64)
+            hist_pred = conf_matrix.sum(axis=0).astype(np.float64)
+            expected = np.outer(hist_true, hist_pred)
+            expected_sum = expected.sum()
+            if expected_sum > 0:
+                expected = expected / expected_sum
+                observed = conf_matrix.astype(np.float64) / total_obs
+                if args.num_classes > 1:
+                    denom_weights = float((args.num_classes - 1) ** 2)
+                else:
+                    denom_weights = 1.0
+                rows = np.arange(args.num_classes)[:, None]
+                cols = np.arange(args.num_classes)[None, :]
+                weights = ((rows - cols) ** 2).astype(np.float64) / denom_weights
+                expected_weighted = float((weights * expected).sum())
+                observed_weighted = float((weights * observed).sum())
+                if expected_weighted > 0:
+                    qwk = 1.0 - observed_weighted / expected_weighted
+
+        return avg_loss, overall_acc, class_acc, macro_f1, qwk
+
+    interrupted = False
+    epoch = 0
+    try:
+        for epoch in range(1, args.epochs + 1):
+            (
+                train_loss,
+                train_acc,
+                train_class_acc,
+                train_macro_f1,
+                train_qwk,
+            ) = run_epoch(train_loader, train=True)
+            if val_loader:
+                (
+                    val_loss,
+                    val_acc,
+                    val_class_acc,
+                    val_macro_f1,
+                    val_qwk,
+                ) = run_epoch(val_loader, train=False)
+            else:
+                val_loss = float("nan")
+                val_acc = float("nan")
+                val_class_acc = [float("nan")] * args.num_classes
+                val_macro_f1 = float("nan")
+                val_qwk = float("nan")
+
+            train_entry = {
                 "epoch": epoch,
                 "split": "train",
                 "loss": train_loss,
                 "accuracy": train_acc,
+                "macro_f1": train_macro_f1,
+                "qwk": train_qwk,
             }
-        )
-        if not np.isnan(val_loss):
-            history.append(
-                {
+            for cls_idx, cls_acc in enumerate(train_class_acc):
+                train_entry[f"accuracy_cls{cls_idx}"] = cls_acc
+            history.append(train_entry)
+
+            if not np.isnan(val_loss):
+                val_entry = {
                     "epoch": epoch,
                     "split": "val",
                     "loss": val_loss,
                     "accuracy": val_acc,
+                    "macro_f1": val_macro_f1,
+                    "qwk": val_qwk,
                 }
-            )
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_epoch = epoch
-                best_state = {
-                    "model": {k: v.cpu() for k, v in model.state_dict().items()},
-                    "classifier": {k: v.cpu() for k, v in model.classifier.state_dict().items()},
-                }
+                for cls_idx, cls_acc in enumerate(val_class_acc):
+                    val_entry[f"accuracy_cls{cls_idx}"] = cls_acc
+                history.append(val_entry)
 
-        log_msg = f"Epoch {epoch:02d} | train_loss={train_loss:.4f} train_acc={train_acc:.3f}"
-        if not np.isnan(val_loss):
-            log_msg += f" | val_loss={val_loss:.4f} val_acc={val_acc:.3f}"
-        logging.info(log_msg)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_epoch = epoch
+                    best_state = {
+                        "model": {k: v.cpu() for k, v in model.state_dict().items()},
+                        "classifier": {k: v.cpu() for k, v in model.classifier.state_dict().items()},
+                    }
+
+            log_parts = [
+                f"Epoch {epoch:02d}",
+                f"train_loss={train_loss:.4f}",
+                f"train_acc={train_acc:.3f}",
+            ]
+            if not np.isnan(train_macro_f1):
+                log_parts.append(f"train_f1={train_macro_f1:.3f}")
+            if not np.isnan(train_qwk):
+                log_parts.append(f"train_qwk={train_qwk:.3f}")
+            if not np.isnan(val_loss):
+                log_parts.extend([
+                    f"val_loss={val_loss:.4f}",
+                    f"val_acc={val_acc:.3f}",
+                ])
+                if not np.isnan(val_macro_f1):
+                    log_parts.append(f"val_f1={val_macro_f1:.3f}")
+                if not np.isnan(val_qwk):
+                    log_parts.append(f"val_qwk={val_qwk:.3f}")
+            logging.info(" | ".join(log_parts))
+
+            def _format_class_acc(accs: Sequence[float]) -> str:
+                parts = []
+                for idx, acc in enumerate(accs):
+                    if np.isnan(acc):
+                        parts.append(f"c{idx}=nan")
+                    else:
+                        parts.append(f"c{idx}={acc:.3f}")
+                return ", ".join(parts)
+
+            logging.info("    train per-class acc: %s", _format_class_acc(train_class_acc))
+            if not np.isnan(val_loss):
+                logging.info("    val   per-class acc: %s", _format_class_acc(val_class_acc))
+
+            if args.save_every and args.save_every > 0 and (epoch % args.save_every == 0):
+                epoch_abmil_path = checkpoints_dir / f"{args.run_name}_abmil_epoch{epoch:03d}.pt"
+                epoch_classifier_path = checkpoints_dir / f"{args.run_name}_classifier_epoch{epoch:03d}.pt"
+                torch.save(model.state_dict(), epoch_abmil_path)
+                torch.save(model.classifier.state_dict(), epoch_classifier_path)
+                logging.info("Saved periodic checkpoints at epoch %d to %s and %s", epoch, epoch_abmil_path, epoch_classifier_path)
+    except KeyboardInterrupt:
+        interrupted = True
+        logging.warning("Training interrupted at epoch %d", epoch)
+
+    if interrupted:
+        logging.info("Proceeding to export artifacts after interruption.")
 
     output_dir = resolve_path(args.output_dir, allow_missing=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -251,16 +434,10 @@ def train(args: argparse.Namespace) -> None:
 
     attention_csv = output_dir / "attention_weights.csv"
     slide_csv = output_dir / "slide_vectors.csv"
-    checkpoints_dir = PROJECT_ROOT / "outputs" / "checkpoints" / "abmil"
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    abmil_last_path = checkpoints_dir / f"{args.run_name}_abmil_last.pt"
-    classifier_last_path = checkpoints_dir / f"{args.run_name}_classifier_last.pt"
     torch.save(model.state_dict(), abmil_last_path)
     torch.save(model.classifier.state_dict(), classifier_last_path)
 
     if best_state is not None:
-        abmil_best_path = checkpoints_dir / f"{args.run_name}_abmil_best.pt"
-        classifier_best_path = checkpoints_dir / f"{args.run_name}_classifier_best.pt"
         torch.save(best_state["model"], abmil_best_path)
         torch.save(best_state["classifier"], classifier_best_path)
     else:
@@ -328,6 +505,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.2, help="Fraction of slides for validation split.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", type=str, default="INFO")
+    parser.add_argument("--save-every", type=int, default=5, help="Save model/classifier checkpoints every N epochs.")
     return parser.parse_args(argv)
 
 
