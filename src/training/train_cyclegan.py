@@ -33,7 +33,7 @@ ensure_project_root_on_syspath()
 PROJECT_ROOT = get_project_root()
 
 # --- Import your custom modules ---
-from src.models.Backbone_model.CycleGAN import UNetGenerator, Discriminator
+from src.models.Backbone_model.CycleGANv3 import UNetGenerator, Discriminator
 from data.build_cyclegan_dataset import make_loaders_from_metadata, METADATA_CSV, BATCH_SIZE
 
 DEFAULT_OUTPUTS_DIR = PROJECT_ROOT / "outputs"
