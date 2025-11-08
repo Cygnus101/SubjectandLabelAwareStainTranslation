@@ -48,7 +48,7 @@ PREVIEW_SAMPLE_COUNT = 9
 # Replay Buffer (stabilizes discriminator training)
 # ==============================================================================
 class ReplayBuffer:
-    def __init__(self, max_size=50):
+    def __init__(self, max_size=300):
         self.max_size = max_size
         self.data = []
 
