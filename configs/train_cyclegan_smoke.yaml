@@ -1,0 +1,36 @@
+# Example configuration for train_cyclegan.py
+# This file lists commonly tuned arguments for a quick sanity run.
+# (Pass the options manually when launching, e.g.:
+#  python src/training/train_cyclegan.py --run-id smoke_test_new_cyclegan ...)
+
+# Data
+metadata: metadata.csv
+batch_size: 1          # use 1 patch per domain to keep memory low
+num_workers: 0         # disable background workers for laptop/server parity
+prefetch_factor: 0     # ignored when num_workers = 0
+subset: 0.01           # sample 1% of metadata for smoke tests
+legacy_root: []        # add extra patch roots here if needed
+
+# Training
+run_id: smoke_test_new_cyclegan
+num_epochs: 5
+lr_gen: 0.0004
+lr_disc: 0.0002
+lambda_cycle: 10.0
+lambda_identity: 5.0
+g_steps: 1
+d_steps: 1
+gen_warmup_epochs: 0
+instance_noise: false
+instance_noise_sigma: 0.04
+instance_noise_epochs: 5
+seed: 42
+
+# Paths / logging
+checkpoints_dir: outputs/checkpoints/cyclegan
+logs_dir: outputs/logs/cyclegan
+samples_dir: outputs/samples/cyclegan
+save_model_every: 1
+save_samples_every: 1
+resume_dir: null
+resume_epoch: null
