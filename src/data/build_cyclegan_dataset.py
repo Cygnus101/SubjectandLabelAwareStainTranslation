@@ -39,7 +39,7 @@ LOG_FILE = resolve_project_path("outputs/logs/dataloader_skips.log", allow_missi
 BATCH_SIZE = 64
 NUM_WORKERS = 12
 PREFETCH_FACTOR = 4
-PIN_MEMORY = torch.cuda.is_available()
+PIN_MEMORY = True
 PERSISTENT_WORKERS = NUM_WORKERS > 0
 DROP_LAST = True
 
