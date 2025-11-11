@@ -19,6 +19,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.amp import autocast, GradScaler
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
 
@@ -48,22 +49,23 @@ PREVIEW_SAMPLE_COUNT = 9
 # Replay Buffer (stabilizes discriminator training)
 # ==============================================================================
 class ReplayBuffer:
-    def __init__(self, max_size=300):
+    def __init__(self, max_size=50):
         self.max_size = max_size
         self.data = []
 
     def push_and_pop(self, data_batch):
         images_to_return = []
-        for element in data_batch.data:
+        for element in data_batch.detach():
             element = torch.unsqueeze(element, 0)
             if len(self.data) < self.max_size:
-                self.data.append(element)
+                self.data.append(element.cpu())
                 images_to_return.append(element)
             else:
                 if random.random() > 0.5:
                     i = random.randint(0, self.max_size - 1)
-                    images_to_return.append(self.data[i].clone())
-                    self.data[i] = element
+                    cached = self.data[i].to(element.device, non_blocking=True)
+                    images_to_return.append(cached)
+                    self.data[i] = element.cpu()
                 else:
                     images_to_return.append(element)
         return torch.cat(images_to_return)
@@ -240,7 +242,7 @@ def main(args):
     else:
         device = torch.device("cpu")
         use_amp = False  # gate AMP on CUDA only
-    autocast_ctx = torch.cuda.amp.autocast if use_amp else nullcontext
+    autocast_ctx = (lambda: autocast("cuda")) if use_amp else nullcontext
 
     checkpoints_dir = Path(args.checkpoints_dir)
     logs_dir = Path(args.logs_dir)
@@ -325,8 +327,8 @@ def main(args):
     fixed_he = torch.cat(collected_he, dim=0)
     fixed_ret = torch.cat(collected_ret, dim=0)
     preview_count = min(PREVIEW_SAMPLE_COUNT, fixed_he.size(0), fixed_ret.size(0))
-    fixed_he = fixed_he[:preview_count].to(device)
-    fixed_ret = fixed_ret[:preview_count].to(device)
+    fixed_he = fixed_he[:preview_count].cpu()
+    fixed_ret = fixed_ret[:preview_count].cpu()
 
     # --- Initialize models ---
     G_H2R = UNetGenerator().to(device)   # H&E → Reticulin
@@ -341,8 +343,8 @@ def main(args):
     cycle_loss = nn.L1Loss()
     identity_loss = nn.L1Loss()
 
-    scaler_G = torch.cuda.amp.GradScaler() if use_amp else None
-    scaler_D = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler_G = GradScaler(device="cuda") if use_amp else None
+    scaler_D = GradScaler(device="cuda") if use_amp else None
 
     # --- Replay buffers ---
     buffer_fake_H = ReplayBuffer()
@@ -421,7 +423,8 @@ def main(args):
             logging.info("Generator warmup complete; enabling adversarial training.")
 
         for _, (real_H, real_R, _) in enumerate(loop):
-            real_H, real_R = real_H.to(device), real_R.to(device)
+            real_H = real_H.to(device, non_blocking=True)
+            real_R = real_R.to(device, non_blocking=True)
 
             disc_loss_acc = 0.0
             gen_loss_acc = 0.0
@@ -429,12 +432,14 @@ def main(args):
             # --- Train Discriminators ---
             if not warmup_phase:
                 for _ in range(args.d_steps):
-                    with autocast_ctx():
+                    with torch.no_grad():
                         fake_R = G_H2R(real_H)
                         fake_H = G_R2H(real_R)
 
-                        fake_H_buffer = buffer_fake_H.push_and_pop(fake_H.detach())
-                        fake_R_buffer = buffer_fake_R.push_and_pop(fake_R.detach())
+                    fake_H_buffer = buffer_fake_H.push_and_pop(fake_H)
+                    fake_R_buffer = buffer_fake_R.push_and_pop(fake_R)
+
+                    with autocast_ctx():
 
                         if args.instance_noise:
                             real_H_in = add_instance_noise(
@@ -485,6 +490,10 @@ def main(args):
 
             # --- Train Generators ---
             for _ in range(args.g_steps):
+                for p in D_H.parameters():
+                    p.requires_grad_(False)
+                for p in D_R.parameters():
+                    p.requires_grad_(False)
                 with autocast_ctx():
                     fake_R = G_H2R(real_H)
                     fake_H = G_R2H(real_R)
@@ -521,6 +530,10 @@ def main(args):
                 else:
                     loss_G.backward()
                     opt_G.step()
+                for p in D_H.parameters():
+                    p.requires_grad_(True)
+                for p in D_R.parameters():
+                    p.requires_grad_(True)
 
                 gen_loss_acc += float(loss_G.detach().cpu())
 
@@ -546,20 +559,22 @@ def main(args):
             G_H2R.eval()
             G_R2H.eval()
             with torch.no_grad():
-                fake_R_sample = G_H2R(fixed_he)
-                fake_H_sample = G_R2H(fixed_ret)
-                he_pair = torch.cat([fixed_he, fake_R_sample], dim=0)
-                ret_pair = torch.cat([fixed_ret, fake_H_sample], dim=0)
-                save_image(
-                    he_pair * 0.5 + 0.5,
-                    str(run_samples_dir / f"he_to_ret_epoch{epoch}.jpg"),
-                    nrow=preview_count,
-                )
-                save_image(
-                    ret_pair * 0.5 + 0.5,
-                    str(run_samples_dir / f"ret_to_he_epoch{epoch}.jpg"),
-                    nrow=preview_count,
-                )
+                he_cpu = fixed_he.to(device, non_blocking=True)
+                ret_cpu = fixed_ret.to(device, non_blocking=True)
+                fake_R_sample = G_H2R(he_cpu)
+                fake_H_sample = G_R2H(ret_cpu)
+            he_pair = torch.cat([he_cpu.cpu(), fake_R_sample.cpu()], dim=0)
+            ret_pair = torch.cat([ret_cpu.cpu(), fake_H_sample.cpu()], dim=0)
+            save_image(
+                he_pair * 0.5 + 0.5,
+                str(run_samples_dir / f"he_to_ret_epoch{epoch}.jpg"),
+                nrow=preview_count,
+            )
+            save_image(
+                ret_pair * 0.5 + 0.5,
+                str(run_samples_dir / f"ret_to_he_epoch{epoch}.jpg"),
+                nrow=preview_count,
+            )
             G_H2R.train()
             G_R2H.train()
 
