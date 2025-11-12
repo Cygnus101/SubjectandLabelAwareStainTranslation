@@ -1,0 +1,17 @@
+# Core ML stack
+torch
+torchvision
+torchmetrics
+
+# Data handling & numerics
+numpy
+pandas
+
+# Imaging
+Pillow
+# openslide-python
+
+# Visualization / utilities
+matplotlib
+tqdm
+IPython
