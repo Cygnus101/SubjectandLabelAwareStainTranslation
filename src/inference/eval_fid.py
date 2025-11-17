@@ -24,6 +24,7 @@ from PIL import Image, UnidentifiedImageError
 import torch
 from torchvision import transforms as T
 from torchmetrics.image.fid import FrechetInceptionDistance
+from tqdm.auto import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_ROOT = SCRIPT_DIR.parent
@@ -283,7 +284,7 @@ def main() -> None:
         ret_canvas = _assemble_slide(ret_entries, args.patch_size)
         _save_canvas(ret_canvas, ret_canvas_path, downsample_factor)
 
-    for ckpt_path in checkpoints:
+    for ckpt_path in tqdm(checkpoints, desc="Checkpoints"):
         ckpt_out = run_dir / ckpt_path.stem
         ckpt_out.mkdir(parents=True, exist_ok=True)
         generator = load_generator(ckpt_path, device)

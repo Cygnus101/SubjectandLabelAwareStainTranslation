@@ -37,7 +37,7 @@ from utils.path import ensure_project_root_on_syspath, get_project_root, resolve
 
 ensure_project_root_on_syspath()
 
-from src.models.Backbone_model.CycleGANv2 import UNetGenerator
+from src.models.Backbone_model.CycleGAN import UNetGenerator
 
 PROJECT_ROOT = get_project_root()
 DEFAULT_METADATA = PROJECT_ROOT / "metadata.csv"
