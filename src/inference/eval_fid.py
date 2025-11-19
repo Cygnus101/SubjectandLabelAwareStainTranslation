@@ -26,6 +26,8 @@ from torchvision import transforms as T
 from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm.auto import tqdm
 
+from tqdm import tqdm
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_ROOT = SCRIPT_DIR.parent
 if str(SRC_ROOT) not in sys.path:
@@ -284,11 +286,20 @@ def main() -> None:
         ret_canvas = _assemble_slide(ret_entries, args.patch_size)
         _save_canvas(ret_canvas, ret_canvas_path, downsample_factor)
 
-    for ckpt_path in tqdm(checkpoints, desc="Checkpoints"):
+    for ckpt_path in tqdm(checkpoints, desc="Evaluating checkpoints"):
         ckpt_out = run_dir / ckpt_path.stem
         ckpt_out.mkdir(parents=True, exist_ok=True)
+
         generator = load_generator(ckpt_path, device)
-        generated_entries = _generate_reticulin_patches(generator, he_rows, args.patch_size, device, ckpt_out / "generated_patches")
+
+        generated_entries = _generate_reticulin_patches(
+            generator,
+            he_rows,
+            args.patch_size,
+            device,
+            ckpt_out / "generated_patches"
+        )
+
         generated_canvas = _assemble_slide(generated_entries, args.patch_size)
         gen_canvas_path = ckpt_out / f"{lab_id}_generated_reticulin.png"
         _save_canvas(generated_canvas, gen_canvas_path, downsample_factor)
@@ -298,6 +309,7 @@ def main() -> None:
             fake_paths=[entry.path for entry in generated_entries],
             device=device,
         )
+
         logging.info("[%s] FID (generated vs real Reticulin): %.4f", ckpt_path.name, fid_value)
 
 
