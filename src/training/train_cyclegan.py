@@ -12,7 +12,7 @@ import logging
 import re
 import random
 import sys
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +20,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
+from torch.profiler import (
+    ProfilerActivity,
+    profile as torch_profile,
+    schedule as profiler_schedule,
+    tensorboard_trace_handler,
+)
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
 
@@ -40,6 +46,7 @@ from data.build_cyclegan_dataset import make_loaders_from_metadata, METADATA_CSV
 DEFAULT_OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 DEFAULT_CHECKPOINTS_DIR = DEFAULT_OUTPUTS_DIR / "checkpoints" / "cyclegan"
 DEFAULT_LOGS_DIR = DEFAULT_OUTPUTS_DIR / "logs"
+DEFAULT_PROFILER_DIR = DEFAULT_LOGS_DIR / "profiler"
 DEFAULT_SAMPLES_DIR = DEFAULT_OUTPUTS_DIR / "samples" / "cyclegan"
 CHECKPOINT_PREFIXES = ("G_H2R", "G_R2H", "D_H", "D_R")
 HISTORY_FILENAME = "history.json"
@@ -228,6 +235,44 @@ def _save_loss_plot(history, output_path: str | Path) -> None:
     plt.close()
     logging.info(f"Saved loss curves to {out_path}")
 
+
+def _build_profiler_context(args, device: torch.device):
+    """Return context manager for optional PyTorch profiler."""
+    if not args.profile:
+        return nullcontext()
+
+    activities = [ProfilerActivity.CPU]
+    if device.type == "cuda":
+        activities.append(ProfilerActivity.CUDA)
+
+    trace_dir = Path(args.profile_dir) / args.run_id
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    handler = tensorboard_trace_handler(str(trace_dir))
+    schedule = profiler_schedule(
+        wait=args.profile_wait,
+        warmup=args.profile_warmup,
+        active=args.profile_active,
+        repeat=args.profile_repeat,
+        skip_first=args.profile_skip_first,
+    )
+    logging.info(
+        "Profiler enabled (wait=%d, warmup=%d, active=%d, repeat=%d, skip_first=%d). Traces → %s",
+        args.profile_wait,
+        args.profile_warmup,
+        args.profile_active,
+        args.profile_repeat,
+        args.profile_skip_first,
+        trace_dir,
+    )
+    return torch_profile(
+        activities=activities,
+        schedule=schedule,
+        on_trace_ready=handler,
+        record_shapes=args.profile_record_shapes,
+        profile_memory=args.profile_memory,
+        with_stack=args.profile_with_stack,
+    )
+
 # ==============================================================================
 # Training Function
 # ==============================================================================
@@ -412,182 +457,186 @@ def main(args):
     else:
         global_d_step = 0
 
-    for epoch in range(start_epoch, args.num_epochs + 1):
-        loop = tqdm(train_loader, desc=f"Epoch [{epoch}/{args.num_epochs}]")
+    with ExitStack() as stack:
+        profiler = stack.enter_context(_build_profiler_context(args, device))
+        for epoch in range(start_epoch, args.num_epochs + 1):
+            loop = tqdm(train_loader, desc=f"Epoch [{epoch}/{args.num_epochs}]")
 
-        running_G, running_D = 0.0, 0.0
-        batch_count = 0
-        warmup_phase = epoch <= warmup_epochs
+            running_G, running_D = 0.0, 0.0
+            batch_count = 0
+            warmup_phase = epoch <= warmup_epochs
 
-        if warmup_epochs > 0 and epoch == warmup_epochs + 1:
-            logging.info("Generator warmup complete; enabling adversarial training.")
+            if warmup_epochs > 0 and epoch == warmup_epochs + 1:
+                logging.info("Generator warmup complete; enabling adversarial training.")
 
-        for _, (real_H, real_R, _) in enumerate(loop):
-            real_H = real_H.to(device, non_blocking=True)
-            real_R = real_R.to(device, non_blocking=True)
+            for _, (real_H, real_R, _) in enumerate(loop):
+                real_H = real_H.to(device, non_blocking=True)
+                real_R = real_R.to(device, non_blocking=True)
 
-            disc_loss_acc = 0.0
-            gen_loss_acc = 0.0
+                disc_loss_acc = 0.0
+                gen_loss_acc = 0.0
 
-            # --- Train Discriminators ---
-            if not warmup_phase:
-                for _ in range(args.d_steps):
-                    with torch.no_grad():
+                # --- Train Discriminators ---
+                if not warmup_phase:
+                    for _ in range(args.d_steps):
+                        with torch.no_grad():
+                            fake_R = G_H2R(real_H)
+                            fake_H = G_R2H(real_R)
+
+                        fake_H_buffer = buffer_fake_H.push_and_pop(fake_H)
+                        fake_R_buffer = buffer_fake_R.push_and_pop(fake_R)
+
+                        with autocast_ctx():
+
+                            if args.instance_noise:
+                                real_H_in = add_instance_noise(
+                                    real_H, global_d_step, noise_total_steps, args.instance_noise_sigma
+                                )
+                                real_R_in = add_instance_noise(
+                                    real_R, global_d_step, noise_total_steps, args.instance_noise_sigma
+                                )
+                                fake_H_in = add_instance_noise(
+                                    fake_H_buffer, global_d_step, noise_total_steps, args.instance_noise_sigma
+                                )
+                                fake_R_in = add_instance_noise(
+                                    fake_R_buffer, global_d_step, noise_total_steps, args.instance_noise_sigma
+                                )
+                            else:
+                                real_H_in = real_H
+                                real_R_in = real_R
+                                fake_H_in = fake_H_buffer
+                                fake_R_in = fake_R_buffer
+
+                            D_H_real = D_H(real_H_in)
+                            D_H_fake = D_H(fake_H_in)
+                            D_H_loss = 0.5 * (
+                                adv_loss(D_H_real, torch.ones_like(D_H_real))
+                                + adv_loss(D_H_fake, torch.zeros_like(D_H_fake))
+                            )
+
+                            D_R_real = D_R(real_R_in)
+                            D_R_fake = D_R(fake_R_in)
+                            D_R_loss = 0.5 * (
+                                adv_loss(D_R_real, torch.ones_like(D_R_real))
+                                + adv_loss(D_R_fake, torch.zeros_like(D_R_fake))
+                            )
+
+                            loss_D = 0.5 * (D_H_loss + D_R_loss)
+
+                        opt_D.zero_grad()
+                        if use_amp:
+                            scaler_D.scale(loss_D).backward()
+                            scaler_D.step(opt_D)
+                            scaler_D.update()
+                        else:
+                            loss_D.backward()
+                            opt_D.step()
+
+                        disc_loss_acc += float(loss_D.detach().cpu())
+                        global_d_step += 1
+
+                # --- Train Generators ---
+                for _ in range(args.g_steps):
+                    for p in D_H.parameters():
+                        p.requires_grad_(False)
+                    for p in D_R.parameters():
+                        p.requires_grad_(False)
+                    with autocast_ctx():
                         fake_R = G_H2R(real_H)
                         fake_H = G_R2H(real_R)
 
-                    fake_H_buffer = buffer_fake_H.push_and_pop(fake_H)
-                    fake_R_buffer = buffer_fake_R.push_and_pop(fake_R)
+                        cycled_H = G_R2H(fake_R)
+                        cycled_R = G_H2R(fake_H)
+                        loss_cycle = cycle_loss(real_H, cycled_H) + cycle_loss(real_R, cycled_R)
 
-                    with autocast_ctx():
+                        loss_id = identity_loss(real_H, G_R2H(real_H)) + identity_loss(real_R, G_H2R(real_R))
 
-                        if args.instance_noise:
-                            real_H_in = add_instance_noise(
-                                real_H, global_d_step, noise_total_steps, args.instance_noise_sigma
-                            )
-                            real_R_in = add_instance_noise(
-                                real_R, global_d_step, noise_total_steps, args.instance_noise_sigma
-                            )
-                            fake_H_in = add_instance_noise(
-                                fake_H_buffer, global_d_step, noise_total_steps, args.instance_noise_sigma
-                            )
-                            fake_R_in = add_instance_noise(
-                                fake_R_buffer, global_d_step, noise_total_steps, args.instance_noise_sigma
+                        if warmup_phase:
+                            loss_G = (
+                                args.lambda_cycle * loss_cycle
+                                + args.lambda_identity * loss_id
                             )
                         else:
-                            real_H_in = real_H
-                            real_R_in = real_R
-                            fake_H_in = fake_H_buffer
-                            fake_R_in = fake_R_buffer
+                            pred_fake_H = D_H(fake_H)
+                            pred_fake_R = D_R(fake_R)
+                            loss_G_H_adv = adv_loss(pred_fake_H, torch.ones_like(pred_fake_H))
+                            loss_G_R_adv = adv_loss(pred_fake_R, torch.ones_like(pred_fake_R))
 
-                        D_H_real = D_H(real_H_in)
-                        D_H_fake = D_H(fake_H_in)
-                        D_H_loss = 0.5 * (
-                            adv_loss(D_H_real, torch.ones_like(D_H_real))
-                            + adv_loss(D_H_fake, torch.zeros_like(D_H_fake))
-                        )
+                            loss_G = (
+                                loss_G_H_adv
+                                + loss_G_R_adv
+                                + args.lambda_cycle * loss_cycle
+                                + args.lambda_identity * loss_id
+                            )
 
-                        D_R_real = D_R(real_R_in)
-                        D_R_fake = D_R(fake_R_in)
-                        D_R_loss = 0.5 * (
-                            adv_loss(D_R_real, torch.ones_like(D_R_real))
-                            + adv_loss(D_R_fake, torch.zeros_like(D_R_fake))
-                        )
-
-                        loss_D = 0.5 * (D_H_loss + D_R_loss)
-
-                    opt_D.zero_grad()
+                    opt_G.zero_grad()
                     if use_amp:
-                        scaler_D.scale(loss_D).backward()
-                        scaler_D.step(opt_D)
-                        scaler_D.update()
+                        scaler_G.scale(loss_G).backward()
+                        scaler_G.step(opt_G)
+                        scaler_G.update()
                     else:
-                        loss_D.backward()
-                        opt_D.step()
+                        loss_G.backward()
+                        opt_G.step()
+                    for p in D_H.parameters():
+                        p.requires_grad_(True)
+                    for p in D_R.parameters():
+                        p.requires_grad_(True)
 
-                    disc_loss_acc += float(loss_D.detach().cpu())
-                    global_d_step += 1
+                    gen_loss_acc += float(loss_G.detach().cpu())
 
-            # --- Train Generators ---
-            for _ in range(args.g_steps):
-                for p in D_H.parameters():
-                    p.requires_grad_(False)
-                for p in D_R.parameters():
-                    p.requires_grad_(False)
-                with autocast_ctx():
-                    fake_R = G_H2R(real_H)
-                    fake_H = G_R2H(real_R)
+                avg_d_loss = disc_loss_acc / max(1, args.d_steps)
+                avg_g_loss = gen_loss_acc / max(1, args.g_steps)
 
-                    cycled_H = G_R2H(fake_R)
-                    cycled_R = G_H2R(fake_H)
-                    loss_cycle = cycle_loss(real_H, cycled_H) + cycle_loss(real_R, cycled_R)
+                loop.set_postfix(G_loss=avg_g_loss, D_loss=avg_d_loss)
+                running_G += avg_g_loss
+                running_D += avg_d_loss
+                batch_count += 1
+                if profiler is not None:
+                    profiler.step()
 
-                    loss_id = identity_loss(real_H, G_R2H(real_H)) + identity_loss(real_R, G_H2R(real_R))
-
-                    if warmup_phase:
-                        loss_G = (
-                            args.lambda_cycle * loss_cycle
-                            + args.lambda_identity * loss_id
-                        )
-                    else:
-                        pred_fake_H = D_H(fake_H)
-                        pred_fake_R = D_R(fake_R)
-                        loss_G_H_adv = adv_loss(pred_fake_H, torch.ones_like(pred_fake_H))
-                        loss_G_R_adv = adv_loss(pred_fake_R, torch.ones_like(pred_fake_R))
-
-                        loss_G = (
-                            loss_G_H_adv
-                            + loss_G_R_adv
-                            + args.lambda_cycle * loss_cycle
-                            + args.lambda_identity * loss_id
-                        )
-
-                opt_G.zero_grad()
-                if use_amp:
-                    scaler_G.scale(loss_G).backward()
-                    scaler_G.step(opt_G)
-                    scaler_G.update()
-                else:
-                    loss_G.backward()
-                    opt_G.step()
-                for p in D_H.parameters():
-                    p.requires_grad_(True)
-                for p in D_R.parameters():
-                    p.requires_grad_(True)
-
-                gen_loss_acc += float(loss_G.detach().cpu())
-
-            avg_d_loss = disc_loss_acc / max(1, args.d_steps)
-            avg_g_loss = gen_loss_acc / max(1, args.g_steps)
-
-            loop.set_postfix(G_loss=avg_g_loss, D_loss=avg_d_loss)
-            running_G += avg_g_loss
-            running_D += avg_d_loss
-            batch_count += 1
-
-        history.append(
-            {
-                "epoch": epoch,
-                "gen_loss": running_G / max(1, batch_count),
-                "disc_loss": running_D / max(1, batch_count),
-            }
-        )
-        _save_history_file(history_path, history)
-
-        # --- Save samples (deterministic cached pair) ---
-        if epoch % args.save_samples_every == 0:
-            G_H2R.eval()
-            G_R2H.eval()
-            with torch.no_grad():
-                he_cpu = fixed_he.to(device, non_blocking=True)
-                ret_cpu = fixed_ret.to(device, non_blocking=True)
-                fake_R_sample = G_H2R(he_cpu)
-                fake_H_sample = G_R2H(ret_cpu)
-            he_pair = torch.cat([he_cpu.cpu(), fake_R_sample.cpu()], dim=0)
-            ret_pair = torch.cat([ret_cpu.cpu(), fake_H_sample.cpu()], dim=0)
-            save_image(
-                he_pair * 0.5 + 0.5,
-                str(run_samples_dir / f"he_to_ret_epoch{epoch}.jpg"),
-                nrow=preview_count,
+            history.append(
+                {
+                    "epoch": epoch,
+                    "gen_loss": running_G / max(1, batch_count),
+                    "disc_loss": running_D / max(1, batch_count),
+                }
             )
-            save_image(
-                ret_pair * 0.5 + 0.5,
-                str(run_samples_dir / f"ret_to_he_epoch{epoch}.jpg"),
-                nrow=preview_count,
-            )
-            G_H2R.train()
-            G_R2H.train()
+            _save_history_file(history_path, history)
 
-        # --- Persist loss curve every epoch ---
-        loss_plot_path = logs_dir / f"{args.run_id}_loss_curve.png"
-        _save_loss_plot(history, loss_plot_path)
+            # --- Save samples (deterministic cached pair) ---
+            if epoch % args.save_samples_every == 0:
+                G_H2R.eval()
+                G_R2H.eval()
+                with torch.no_grad():
+                    he_cpu = fixed_he.to(device, non_blocking=True)
+                    ret_cpu = fixed_ret.to(device, non_blocking=True)
+                    fake_R_sample = G_H2R(he_cpu)
+                    fake_H_sample = G_R2H(ret_cpu)
+                he_pair = torch.cat([he_cpu.cpu(), fake_R_sample.cpu()], dim=0)
+                ret_pair = torch.cat([ret_cpu.cpu(), fake_H_sample.cpu()], dim=0)
+                save_image(
+                    he_pair * 0.5 + 0.5,
+                    str(run_samples_dir / f"he_to_ret_epoch{epoch}.jpg"),
+                    nrow=preview_count,
+                )
+                save_image(
+                    ret_pair * 0.5 + 0.5,
+                    str(run_samples_dir / f"ret_to_he_epoch{epoch}.jpg"),
+                    nrow=preview_count,
+                )
+                G_H2R.train()
+                G_R2H.train()
 
-        # --- Save checkpoints ---
-        if epoch % args.save_model_every == 0:
-            save_checkpoint(G_H2R, opt_G, scaler_G, run_ckpt_dir / f"G_H2R_epoch{epoch}.pth.tar")
-            save_checkpoint(G_R2H, opt_G, scaler_G, run_ckpt_dir / f"G_R2H_epoch{epoch}.pth.tar")
-            save_checkpoint(D_H,   opt_D, scaler_D, run_ckpt_dir / f"D_H_epoch{epoch}.pth.tar")
-            save_checkpoint(D_R,   opt_D, scaler_D, run_ckpt_dir / f"D_R_epoch{epoch}.pth.tar")
+            # --- Persist loss curve every epoch ---
+            loss_plot_path = logs_dir / f"{args.run_id}_loss_curve.png"
+            _save_loss_plot(history, loss_plot_path)
+
+            # --- Save checkpoints ---
+            if epoch % args.save_model_every == 0:
+                save_checkpoint(G_H2R, opt_G, scaler_G, run_ckpt_dir / f"G_H2R_epoch{epoch}.pth.tar")
+                save_checkpoint(G_R2H, opt_G, scaler_G, run_ckpt_dir / f"G_R2H_epoch{epoch}.pth.tar")
+                save_checkpoint(D_H,   opt_D, scaler_D, run_ckpt_dir / f"D_H_epoch{epoch}.pth.tar")
+                save_checkpoint(D_R,   opt_D, scaler_D, run_ckpt_dir / f"D_R_epoch{epoch}.pth.tar")
 
     logging.info("Training complete")
     loss_plot_path = logs_dir / f"{args.run_id}_loss_curve.png"
@@ -684,6 +733,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Epoch to resume from (defaults to latest available in --resume-dir).",
     )
+    # Profiler
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable PyTorch profiler around the training loop.",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default=str(DEFAULT_PROFILER_DIR),
+        help="Directory where profiler traces (TensorBoard) should be stored.",
+    )
+    parser.add_argument("--profile-wait", type=int, default=1, help="Profiler schedule wait steps.")
+    parser.add_argument("--profile-warmup", type=int, default=1, help="Profiler warmup steps.")
+    parser.add_argument("--profile-active", type=int, default=3, help="Profiler active steps.")
+    parser.add_argument("--profile-repeat", type=int, default=1, help="Profiler schedule repeats.")
+    parser.add_argument("--profile-skip-first", type=int, default=0, help="Profiler steps to skip before scheduling.")
+    parser.add_argument(
+        "--profile-record-shapes",
+        action="store_true",
+        help="Record tensor shapes in profiler traces.",
+    )
+    parser.add_argument(
+        "--profile-memory",
+        action="store_true",
+        help="Track memory usage in profiler traces.",
+    )
+    parser.add_argument(
+        "--profile-with-stack",
+        action="store_true",
+        help="Capture Python stack traces in profiler events.",
+    )
 
     # Misc
     parser.add_argument("--legacy-root", action="append", default=[], help="Additional directories to resolve patch paths from.")
@@ -702,6 +783,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.checkpoints_dir = _resolve_path(args.checkpoints_dir)
     args.logs_dir = _resolve_path(args.logs_dir)
     args.samples_dir = _resolve_path(args.samples_dir)
+    args.profile_dir = _resolve_path(args.profile_dir)
     args.resume_dir = _resolve_path(args.resume_dir) if args.resume_dir else None
     args.legacy_root = [ _resolve_path(p) for p in args.legacy_root ]
     if args.lr is not None:
@@ -718,6 +800,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             raise ValueError("--instance-noise-sigma must be positive when instance noise is enabled.")
         if args.instance_noise_epochs <= 0:
             raise ValueError("--instance-noise-epochs must be positive when instance noise is enabled.")
+    if args.profile:
+        schedule_fields = [
+            ("--profile-wait", args.profile_wait),
+            ("--profile-warmup", args.profile_warmup),
+            ("--profile-active", args.profile_active),
+            ("--profile-repeat", args.profile_repeat),
+            ("--profile-skip-first", args.profile_skip_first),
+        ]
+        for flag, value in schedule_fields:
+            if value < 0:
+                raise ValueError(f"{flag} cannot be negative when profiling is enabled.")
+        if args.profile_active == 0:
+            raise ValueError("--profile-active must be positive when profiling is enabled.")
+        if args.profile_repeat == 0:
+            raise ValueError("--profile-repeat must be positive when profiling is enabled.")
     return args
 
 
