@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
+import numpy as np
 import pandas as pd
 from PIL import Image, UnidentifiedImageError
 import torch
@@ -258,7 +259,34 @@ class SlidePatchDataset(Dataset):
         he_stack = self._load_stack(record.he_paths)
         ret_stack = self._load_stack(record.ret_paths)
         grade = torch.tensor(record.grade, dtype=torch.long)
-        return he_stack, ret_stack, grade, record.slide_id
+        return he_stack, ret_stack, grade, record.ret_stain_id
+
+
+class SlideEmbeddingBank:
+    def __init__(self, slide_embeddings: dict[str, torch.Tensor]) -> None:
+        if not slide_embeddings:
+            raise ValueError("Slide embedding bank is empty.")
+        self._slide_embeddings = slide_embeddings
+        self._ids = list(slide_embeddings.keys())
+
+    def get(self, slide_id: str) -> torch.Tensor:
+        emb = self._slide_embeddings.get(slide_id)
+        if emb is None:
+            raise KeyError(f"Slide '{slide_id}' missing from embedding bank.")
+        return emb
+
+    def sample(self, exclude: set[str], k: int) -> torch.Tensor:
+        candidates = [sid for sid in self._ids if sid not in exclude]
+        if not candidates:
+            raise RuntimeError("No available negatives for contrastive bank sampling.")
+        if k <= 0:
+            raise ValueError("Number of negatives K must be positive.")
+        if len(candidates) < k:
+            selected = candidates
+        else:
+            selected = random.sample(candidates, k)
+        tensors = [self._slide_embeddings[sid] for sid in selected]
+        return torch.stack(tensors, dim=0)
 
 
 def build_loader(args: argparse.Namespace) -> tuple[SlidePatchDataset, DataLoader]:
@@ -316,7 +344,11 @@ def _load_state_dict(module: nn.Module, checkpoint_path: Path, key: Optional[str
 
 def build_feature_extractor(args: argparse.Namespace, device: torch.device) -> nn.Module:
     if FeatureExtractor is not None:
-        model = FeatureExtractor()  # type: ignore[call-arg]
+        model = FeatureExtractor(  # type: ignore[call-arg]
+            pretrained=False,
+            proj_hidden_dim=args.encoder_proj_hidden,
+            proj_out_dim=args.encoder_proj_out,
+        )
         _load_state_dict(model, resolve_path(args.pretrained_encoder))
     else:
         ctor = ENCODER_REGISTRY.get(args.encoder_backbone.lower())
@@ -410,6 +442,84 @@ def compute_contrastive_loss(
         pos = idx - bsz
         losses.append(F.logsumexp(sim[idx], dim=0) - sim[idx, pos])
     return torch.stack(losses).mean()
+
+
+def compute_contrastive_loss_with_bank(
+    z_fake: torch.Tensor,
+    slide_ids: Sequence[str],
+    bank: SlideEmbeddingBank,
+    projector: ProjectionHead,
+    num_negatives: int,
+    temperature: float,
+) -> torch.Tensor:
+    batch = z_fake.size(0)
+    if batch != len(slide_ids):
+        raise ValueError("slide_ids length must match batch size.")
+    device = z_fake.device
+    e_fake = z_fake.mean(dim=1)
+    q_fake = F.normalize(projector(e_fake), dim=1)
+    positives: list[torch.Tensor] = []
+    batch_ids = list(slide_ids)
+    for sid in batch_ids:
+        positives.append(bank.get(sid))
+    pos_tensor = torch.stack(positives, dim=0).to(device)
+    q_pos = F.normalize(projector(pos_tensor), dim=1)
+
+    losses: list[torch.Tensor] = []
+    exclude_batch = set(batch_ids)
+    for idx, sid in enumerate(batch_ids):
+        exclude = set(exclude_batch)
+        exclude.add(sid)
+        negatives = bank.sample(exclude, num_negatives).to(device)
+        q_neg = F.normalize(projector(negatives), dim=1)
+        anchor = q_fake[idx]
+        pos = q_pos[idx]
+        pos_logit = torch.dot(anchor, pos) / temperature
+        neg_logits = (q_neg @ anchor) / temperature
+        logits = torch.cat([pos_logit.unsqueeze(0), neg_logits], dim=0)
+        loss = -(pos_logit - torch.logsumexp(logits, dim=0))
+        losses.append(loss)
+    return torch.stack(losses).mean()
+
+
+def load_embedding_bank(root: Path, dataset: SlidePatchDataset) -> SlideEmbeddingBank:
+    root = resolve_path(root)
+    if not root.exists():
+        raise FileNotFoundError(f"Reticulin embedding directory not found: {root}")
+    file_lookup: dict[str, Path] = {}
+    for npy_path in root.rglob("*.npy"):
+        key = npy_path.stem
+        if key in file_lookup:
+            LOGGER.warning("Duplicate embedding for %s; keeping the first instance (%s)", key, file_lookup[key])
+            continue
+        file_lookup[key] = npy_path
+
+    slide_embeddings: dict[str, torch.Tensor] = {}
+    missing_vectors = 0
+    for record in dataset.entries:
+        vectors: list[torch.Tensor] = []
+        for patch_path in record.ret_paths:
+            key = patch_path.stem
+            emb_path = file_lookup.get(key)
+            if emb_path is None:
+                missing_vectors += 1
+                continue
+            vec = torch.from_numpy(np.load(emb_path)).float()
+            vectors.append(vec)
+        if not vectors:
+            continue
+        slide_embeddings[record.ret_stain_id] = torch.stack(vectors).mean(dim=0)
+    if not slide_embeddings:
+        raise RuntimeError(
+            "Unable to build embedding bank: no matched slides between metadata and "
+            f"embeddings located under {root}."
+        )
+    LOGGER.info(
+        "Loaded real reticulin embedding bank for %d slides (missing patch embeddings: %d)",
+        len(slide_embeddings),
+        missing_vectors,
+    )
+    return SlideEmbeddingBank(slide_embeddings)
 
 
 def load_cyclegan_weights(root: Path, generators: tuple[nn.Module, nn.Module], discriminators: tuple[nn.Module, nn.Module]) -> None:
@@ -517,7 +627,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable torch.cuda.amp mixed precision when running on CUDA devices.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--reticulin-embedding-dir",
+        type=str,
+        default=None,
+        help="Directory containing precomputed real reticulin embeddings (.npy).",
+    )
+    parser.add_argument(
+        "--contrastive-negatives",
+        type=int,
+        default=32,
+        help="Number of negative samples drawn from the real embedding bank per slide.",
+    )
+    args = parser.parse_args(argv)
+    if args.reticulin_embedding_dir:
+        args.reticulin_embedding_dir = str(resolve_path(args.reticulin_embedding_dir, allow_missing=True))
+    if args.contrastive_negatives <= 0:
+        raise ValueError("--contrastive-negatives must be positive.")
+    return args
 
 
 def setup_logging(run_dir: Path) -> None:
@@ -557,6 +684,13 @@ def train(args: argparse.Namespace) -> None:
 
     dataset, loader = build_loader(args)
     LOGGER.info("Slides available: %d", len(dataset))
+    embedding_bank: SlideEmbeddingBank | None = None
+    if args.reticulin_embedding_dir:
+        embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset)
+        LOGGER.info(
+            "Using embedding bank for contrastive loss with %d negatives per slide.",
+            args.contrastive_negatives,
+        )
 
     feature_extractor = build_feature_extractor(args, device)
     mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, -1, 1, 1)
@@ -663,19 +797,31 @@ def train(args: argparse.Namespace) -> None:
                 cycle_loss = l1_loss(rec_he, he_batch) + l1_loss(rec_ret, ret_batch)
                 id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
 
-                z_fake = extract_patch_features(feature_extractor, fake_ret, mean, std, require_grad=True)
+            z_fake = extract_patch_features(feature_extractor, fake_ret, mean, std, require_grad=True)
+            z_real = None
+            if embedding_bank is None:
                 z_real = extract_patch_features(feature_extractor, ret_batch, mean, std, require_grad=False)
-
-                cls_loss, _ = compute_classification_loss(z_fake, grades, abmil, slide_classifier, criterion_cls)
+            cls_loss, _ = compute_classification_loss(z_fake, grades, abmil, slide_classifier, criterion_cls)
+            if embedding_bank is not None:
+                contrastive_loss = compute_contrastive_loss_with_bank(
+                    z_fake,
+                    slide_ids,
+                    embedding_bank,
+                    projector,
+                    args.contrastive_negatives,
+                    args.temperature,
+                )
+            else:
+                assert z_real is not None
                 contrastive_loss = compute_contrastive_loss(z_real, z_fake, projector, args.temperature)
 
-                loss_G = (
-                    adv_loss
-                    + args.lambda_cycle * cycle_loss
-                    + args.lambda_identity * id_loss
-                    + args.lambda_cls * cls_loss
-                    + args.lambda_con * contrastive_loss
-                )
+            loss_G = (
+                adv_loss
+                + args.lambda_cycle * cycle_loss
+                + args.lambda_identity * id_loss
+                + args.lambda_cls * cls_loss
+                + args.lambda_con * contrastive_loss
+            )
 
             opt_G.zero_grad(set_to_none=True)
             if use_amp:
