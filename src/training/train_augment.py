@@ -9,6 +9,7 @@ import logging
 import random
 import re
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -18,6 +19,7 @@ from PIL import Image, UnidentifiedImageError
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 from tqdm.auto import tqdm
@@ -57,10 +59,47 @@ from models.Classification.abmil import ABMIL, SlideClassifier  # noqa: E402
 
 @dataclass
 class SlideRecord:
-    slide_id: str
+    lab_id: str
+    he_stain_id: str
+    ret_stain_id: str
     grade: int
     he_paths: list[Path]
     ret_paths: list[Path]
+
+    @property
+    def slide_id(self) -> str:
+        return f"{self.lab_id}|{self.he_stain_id}|{self.ret_stain_id}"
+
+
+def _numeric_tokens(value: str) -> list[int]:
+    return [int(match.group()) for match in re.finditer(r"\d+", value)]
+
+
+def _stain_prefix(value: str) -> str:
+    cleaned = re.sub(r"\d+", "", value)
+    return cleaned.replace("_", "").replace("-", "").strip().lower()
+
+
+def _closest_stain_id(source: str, candidates: Sequence[str]) -> Optional[str]:
+    if not candidates:
+        return None
+    if source in candidates:
+        return source
+
+    src_tokens = _numeric_tokens(source)
+    src_prefix = _stain_prefix(source)
+
+    def score(candidate: str) -> tuple[int, int, str]:
+        cand_tokens = _numeric_tokens(candidate)
+        cand_prefix = _stain_prefix(candidate)
+        prefix_penalty = 0 if cand_prefix == src_prefix and src_prefix else 1
+        if src_tokens and cand_tokens:
+            diff = abs(src_tokens[-1] - cand_tokens[-1])
+        else:
+            diff = abs(len(source) - len(candidate))
+        return (prefix_penalty, diff, candidate)
+
+    return min(candidates, key=score)
 
 
 def _parse_grade(value: object) -> Optional[int]:
@@ -104,9 +143,13 @@ class SlidePatchDataset(Dataset):
         self.transform = _build_patch_transform(image_size, augment)
         self.patch_retries = max(1, patch_retries)
         self.rng = random.Random(seed)
+        self.missing_patch_paths = 0
+        self._missing_log_limit = 20
         self.entries = self._build_entries(max_slides)
         if not self.entries:
             raise RuntimeError("No slides with both H&E and Reticulin patches were found.")
+        if self.missing_patch_paths:
+            LOGGER.warning("Skipped %d patch files that were missing on disk.", self.missing_patch_paths)
 
     def _normalize_path(self, raw: str) -> Path:
         normalized = raw.replace("\\", "/")
@@ -115,34 +158,68 @@ class SlidePatchDataset(Dataset):
             return path
         return (self.patch_root / path).resolve()
 
+    def _collect_valid_paths(self, raw_paths: Sequence[str]) -> list[Path]:
+        paths: list[Path] = []
+        for raw in raw_paths:
+            path = self._normalize_path(str(raw))
+            if not path.is_file():
+                self.missing_patch_paths += 1
+                if self.missing_patch_paths <= self._missing_log_limit:
+                    LOGGER.warning("Patch file not found: %s", path)
+                elif self.missing_patch_paths == self._missing_log_limit + 1:
+                    LOGGER.warning("Too many missing patch files; suppressing additional warnings.")
+                continue
+            paths.append(path)
+        return paths
+
     def _build_entries(self, max_slides: Optional[int]) -> list[SlideRecord]:
         df = pd.read_csv(self.metadata_path)
-        if {"stain_id", "type", "patch_path", "Reticulin Grade"} - set(df.columns):
-            missing = {"stain_id", "type", "patch_path", "Reticulin Grade"} - set(df.columns)
+        required = {"Lab No.", "stain_id", "type", "patch_path", "Reticulin Grade"}
+        if required - set(df.columns):
+            missing = required - set(df.columns)
             raise ValueError(f"metadata missing required columns: {sorted(missing)}")
 
         df["type_norm"] = df["type"].astype(str).str.lower()
         df["patch_path_norm"] = df["patch_path"].astype(str)
-        ret_df = df[df["type_norm"].str.contains("reticulin", na=False)]
-        he_df = df[df["type_norm"].str.contains("h&e", na=False)]
-        ret_groups = ret_df.groupby("stain_id")
-        he_groups = he_df.groupby("stain_id")
-
+        df["lab_id"] = df["Lab No."].astype(str).str.strip()
+        df = df[df["lab_id"].astype(bool)]
         entries: list[SlideRecord] = []
-        for slide_id, ret_group in ret_groups:
-            if slide_id not in he_groups.groups:
+        for lab_id, lab_df in df.groupby("lab_id"):
+            he_df = lab_df[lab_df["type_norm"].str.contains("h&e", na=False)]
+            ret_df = lab_df[lab_df["type_norm"].str.contains("reticulin", na=False)]
+            if he_df.empty or ret_df.empty:
                 continue
-            grade_value = _parse_grade(ret_group["Reticulin Grade"].iloc[0])
-            if grade_value is None:
-                continue
-            he_group = he_groups.get_group(slide_id)
-            he_paths = [self._normalize_path(p) for p in he_group["patch_path_norm"].tolist()]
-            ret_paths = [self._normalize_path(p) for p in ret_group["patch_path_norm"].tolist()]
-            if not he_paths or not ret_paths:
-                continue
-            entries.append(SlideRecord(slide_id=str(slide_id), grade=grade_value, he_paths=he_paths, ret_paths=ret_paths))
-            if max_slides is not None and len(entries) >= max_slides:
-                break
+
+            he_groups = {str(sid): group for sid, group in he_df.groupby("stain_id")}
+            ret_groups = {str(sid): group for sid, group in ret_df.groupby("stain_id")}
+            ret_ids = list(ret_groups.keys())
+
+            for he_id, he_group in he_groups.items():
+                ret_id = _closest_stain_id(he_id, ret_ids)
+                if ret_id is None:
+                    continue
+                ret_group = ret_groups[ret_id]
+                grade_value = _parse_grade(ret_group["Reticulin Grade"].iloc[0])
+                if grade_value is None:
+                    continue
+
+                he_paths = self._collect_valid_paths(he_group["patch_path_norm"].tolist())
+                ret_paths = self._collect_valid_paths(ret_group["patch_path_norm"].tolist())
+                if not he_paths or not ret_paths:
+                    continue
+
+                entries.append(
+                    SlideRecord(
+                        lab_id=str(lab_id),
+                        he_stain_id=he_id,
+                        ret_stain_id=ret_id,
+                        grade=grade_value,
+                        he_paths=he_paths,
+                        ret_paths=ret_paths,
+                    )
+                )
+                if max_slides is not None and len(entries) >= max_slides:
+                    return entries
         return entries
 
     def __len__(self) -> int:
@@ -269,7 +346,7 @@ def forward_encoder_features(encoder: nn.Module, images: torch.Tensor) -> torch.
 
 
 def normalize_for_encoder(patches: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    flat = patches.view(-1, *patches.shape[2:])
+    flat = patches.view(-1, *patches.shape[2:]).to(dtype=mean.dtype)
     flat = (flat + 1.0) * 0.5
     return (flat - mean) / std
 
@@ -435,6 +512,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument("--max-slide-count", type=int, default=None)
     parser.add_argument("--patch-retries", type=int, default=8)
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable torch.cuda.amp mixed precision when running on CUDA devices.",
+    )
     return parser.parse_args(argv)
 
 
@@ -525,6 +607,13 @@ def train(args: argparse.Namespace) -> None:
     criterion_gan = nn.MSELoss()
     l1_loss = nn.L1Loss()
     criterion_cls = nn.CrossEntropyLoss()
+    use_amp = bool(args.amp and device.type == "cuda")
+    if args.amp and not use_amp:
+        LOGGER.warning("AMP requested but device %s does not support CUDA autocast.", device.type)
+    LOGGER.info("AMP enabled: %s", use_amp)
+    scaler_G = GradScaler(enabled=use_amp)
+    scaler_D = GradScaler(enabled=use_amp)
+    amp_context = autocast if use_amp else nullcontext
 
     history: list[dict[str, float]] = []
 
@@ -546,56 +635,70 @@ def train(args: argparse.Namespace) -> None:
         batches = 0
         for he_batch, ret_batch, grades, slide_ids in tqdm(loader, desc=f"Epoch {epoch}"):
             batches += 1
-            he_batch = he_batch.to(device)
-            ret_batch = ret_batch.to(device)
-            grades = grades.to(device)
+            he_batch = he_batch.to(device, non_blocking=True)
+            ret_batch = ret_batch.to(device, non_blocking=True)
+            grades = grades.to(device, non_blocking=True)
 
             he_flat = he_batch.view(-1, *he_batch.shape[2:])
             ret_flat = ret_batch.view(-1, *ret_batch.shape[2:])
 
-            fake_ret = G_H2R(he_flat).view_as(ret_batch)
-            fake_he = G_R2H(ret_flat).view_as(he_batch)
+            with amp_context():
+                fake_ret_flat = G_H2R(he_flat)
+                fake_he_flat = G_R2H(ret_flat)
+                fake_ret = fake_ret_flat.view_as(ret_batch)
+                fake_he = fake_he_flat.view_as(he_batch)
 
-            rec_he = G_R2H(fake_ret.view(-1, *fake_ret.shape[2:])).view_as(he_batch)
-            rec_ret = G_H2R(fake_he.view(-1, *fake_he.shape[2:])).view_as(ret_batch)
+                rec_he = G_R2H(fake_ret_flat).view_as(he_batch)
+                rec_ret = G_H2R(fake_he_flat).view_as(ret_batch)
 
-            id_ret = G_H2R(ret_flat).view_as(ret_batch)
-            id_he = G_R2H(he_flat).view_as(he_batch)
+                id_ret = G_H2R(ret_flat).view_as(ret_batch)
+                id_he = G_R2H(he_flat).view_as(he_batch)
 
-            pred_fake_ret = D_R(fake_ret.view(-1, *fake_ret.shape[2:]))
-            pred_fake_he = D_H(fake_he.view(-1, *fake_he.shape[2:]))
-            adv_loss = criterion_gan(pred_fake_ret, torch.ones_like(pred_fake_ret)) + criterion_gan(
-                pred_fake_he, torch.ones_like(pred_fake_he)
-            )
+                pred_fake_ret = D_R(fake_ret_flat)
+                pred_fake_he = D_H(fake_he_flat)
+                adv_loss = criterion_gan(pred_fake_ret, torch.ones_like(pred_fake_ret)) + criterion_gan(
+                    pred_fake_he, torch.ones_like(pred_fake_he)
+                )
 
-            cycle_loss = l1_loss(rec_he, he_batch) + l1_loss(rec_ret, ret_batch)
-            id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
+                cycle_loss = l1_loss(rec_he, he_batch) + l1_loss(rec_ret, ret_batch)
+                id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
 
-            z_fake = extract_patch_features(feature_extractor, fake_ret, mean, std, require_grad=True)
-            z_real = extract_patch_features(feature_extractor, ret_batch, mean, std, require_grad=False)
+                z_fake = extract_patch_features(feature_extractor, fake_ret, mean, std, require_grad=True)
+                z_real = extract_patch_features(feature_extractor, ret_batch, mean, std, require_grad=False)
 
-            cls_loss, _ = compute_classification_loss(z_fake, grades, abmil, slide_classifier, criterion_cls)
-            contrastive_loss = compute_contrastive_loss(z_real, z_fake, projector, args.temperature)
+                cls_loss, _ = compute_classification_loss(z_fake, grades, abmil, slide_classifier, criterion_cls)
+                contrastive_loss = compute_contrastive_loss(z_real, z_fake, projector, args.temperature)
 
-            loss_G = (
-                adv_loss
-                + args.lambda_cycle * cycle_loss
-                + args.lambda_identity * id_loss
-                + args.lambda_cls * cls_loss
-                + args.lambda_con * contrastive_loss
-            )
+                loss_G = (
+                    adv_loss
+                    + args.lambda_cycle * cycle_loss
+                    + args.lambda_identity * id_loss
+                    + args.lambda_cls * cls_loss
+                    + args.lambda_con * contrastive_loss
+                )
 
             opt_G.zero_grad(set_to_none=True)
-            loss_G.backward()
-            opt_G.step()
+            if use_amp:
+                scaler_G.scale(loss_G).backward()
+                scaler_G.step(opt_G)
+                scaler_G.update()
+            else:
+                loss_G.backward()
+                opt_G.step()
 
-            D_R_loss, _ = adversarial_loss(D_R, ret_flat, fake_ret.view(-1, *fake_ret.shape[2:]), criterion_gan)
-            D_H_loss, _ = adversarial_loss(D_H, he_flat, fake_he.view(-1, *fake_he.shape[2:]), criterion_gan)
-            loss_D = D_R_loss + D_H_loss
+            with amp_context():
+                D_R_loss, _ = adversarial_loss(D_R, ret_flat, fake_ret_flat, criterion_gan)
+                D_H_loss, _ = adversarial_loss(D_H, he_flat, fake_he_flat, criterion_gan)
+                loss_D = D_R_loss + D_H_loss
 
             opt_D.zero_grad(set_to_none=True)
-            loss_D.backward()
-            opt_D.step()
+            if use_amp:
+                scaler_D.scale(loss_D).backward()
+                scaler_D.step(opt_D)
+                scaler_D.update()
+            else:
+                loss_D.backward()
+                opt_D.step()
 
             epoch_metrics["G"] += loss_G.item()
             epoch_metrics["D"] += loss_D.item()
