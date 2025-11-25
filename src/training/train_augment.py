@@ -12,7 +12,7 @@ import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -34,6 +34,7 @@ from utils.path import ensure_project_root_on_syspath, get_project_root, resolve
 
 ensure_project_root_on_syspath()
 PROJECT_ROOT = get_project_root()
+DEFAULT_TRAIN_AUGMENT_CONFIG = PROJECT_ROOT / "configs" / "train_augment_default.json"
 
 LOGGER = logging.getLogger("train_augment")
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -585,8 +586,37 @@ def save_checkpoints(run_dir: Path, epoch: int, modules: dict[str, nn.Module]) -
         torch.save({"state_dict": module.state_dict()}, path)
 
 
+def _load_cli_defaults(config_path: Optional[str]) -> dict[str, Any]:
+    if not config_path:
+        return {}
+    resolved = resolve_path(config_path, allow_missing=True)
+    if not resolved.exists():
+        return {}
+    try:
+        with resolved.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse training config {resolved}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Training config {resolved} must contain a JSON object.")
+    return payload
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Augmented CycleGAN training")
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument(
+        "--config",
+        type=str,
+        default=str(DEFAULT_TRAIN_AUGMENT_CONFIG),
+        help="Path to JSON config specifying default CLI arguments.",
+    )
+    config_ns, _ = base_parser.parse_known_args(argv)
+    try:
+        config_defaults = _load_cli_defaults(config_ns.config)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    parser = argparse.ArgumentParser(description="Augmented CycleGAN training", parents=[base_parser])
     parser.add_argument("--metadata", type=str, default=str(PROJECT_ROOT / "metadata.csv"))
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--batch-slides", type=int, default=2)
@@ -639,11 +669,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=32,
         help="Number of negative samples drawn from the real embedding bank per slide.",
     )
+    parser.set_defaults(**config_defaults)
     args = parser.parse_args(argv)
     if args.reticulin_embedding_dir:
         args.reticulin_embedding_dir = str(resolve_path(args.reticulin_embedding_dir, allow_missing=True))
     if args.contrastive_negatives <= 0:
         raise ValueError("--contrastive-negatives must be positive.")
+    required = [
+        "pretrained_cyclegan",
+        "pretrained_encoder",
+        "pretrained_abmil",
+        "pretrained_classifier",
+        "run_id",
+    ]
+    missing = [
+        name
+        for name in required
+        if not getattr(args, name)
+        or (isinstance(getattr(args, name), str) and not getattr(args, name).strip())
+    ]
+    if missing:
+        raise ValueError(
+            "Missing required arguments (provide via config or CLI): " + ", ".join(sorted(missing))
+        )
+    args.metadata = str(resolve_path(args.metadata))
+    if args.data_root:
+        args.data_root = str(resolve_path(args.data_root, allow_missing=True))
     return args
 
 
