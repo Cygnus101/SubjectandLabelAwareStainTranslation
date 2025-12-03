@@ -9,6 +9,7 @@ import logging
 import random
 import re
 import sys
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,12 +44,12 @@ GRADE_PATTERN = re.compile(r"(\d+)")
 
 
 try:  # pragma: no cover - fall back to the repo-local definitions
-    from models.Backbone_model.CycleGANv2 import UNetGenerator as CycleGenerator  # type: ignore
-    from models.Backbone_model.CycleGANv2 import Discriminator as CycleDiscriminator  # type: ignore
-
-except:
     from models.Backbone_model.CycleGANv3 import UNetGenerator as CycleGenerator  # type: ignore
     from models.Backbone_model.CycleGANv3 import Discriminator as CycleDiscriminator  # type: ignore
+
+except:
+    from models.Backbone_model.CycleGANv2 import UNetGenerator as CycleGenerator  # type: ignore
+    from models.Backbone_model.CycleGANv2 import Discriminator as CycleDiscriminator  # type: ignore
 
 try:
     from models.Feature_Extractor.Resnet50 import SimCLRModel as FeatureExtractor  # type: ignore
@@ -138,6 +139,7 @@ class SlidePatchDataset(Dataset):
         seed: int,
         max_slides: Optional[int] = None,
         patch_retries: int = 8,
+        subset_pct: Optional[float] = None,
     ) -> None:
         self.metadata_path = resolve_path(metadata_csv)
         self.patch_root = resolve_path(data_root or self.metadata_path.parent)
@@ -145,6 +147,7 @@ class SlidePatchDataset(Dataset):
         self.transform = _build_patch_transform(image_size, augment)
         self.patch_retries = max(1, patch_retries)
         self.rng = random.Random(seed)
+        self.subset_pct = subset_pct
         self.missing_patch_paths = 0
         self._missing_log_limit = 20
         self.entries = self._build_entries(max_slides)
@@ -185,6 +188,14 @@ class SlidePatchDataset(Dataset):
         df["patch_path_norm"] = df["patch_path"].astype(str)
         df["lab_id"] = df["Lab No."].astype(str).str.strip()
         df = df[df["lab_id"].astype(bool)]
+        if self.subset_pct is not None:
+            pct = max(0.0, min(100.0, float(self.subset_pct)))
+            unique_labs = df["lab_id"].unique().tolist()
+            target = max(1, int(round(len(unique_labs) * (pct / 100.0))))
+            if target < len(unique_labs):
+                selected = self.rng.sample(unique_labs, target)
+                df = df[df["lab_id"].isin(selected)]
+            LOGGER.info("Subset active: %.2f%% of labs -> %d labs", pct, df["lab_id"].nunique())
         entries: list[SlideRecord] = []
         for lab_id, lab_df in df.groupby("lab_id"):
             he_df = lab_df[lab_df["type_norm"].str.contains("h&e", na=False)]
@@ -300,6 +311,7 @@ def build_loader(args: argparse.Namespace) -> tuple[SlidePatchDataset, DataLoade
         seed=args.seed,
         max_slides=args.max_slide_count,
         patch_retries=args.patch_retries,
+        subset_pct=args.subset,
     )
     loader = DataLoader(
         dataset,
@@ -629,10 +641,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lr-gen", type=float, default=2e-4)
     parser.add_argument("--lr-disc", type=float, default=2e-4)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--pretrained-cyclegan", type=str, required=True)
-    parser.add_argument("--pretrained-encoder", type=str, required=True)
-    parser.add_argument("--pretrained-abmil", type=str, required=True)
-    parser.add_argument("--pretrained-classifier", type=str, required=True)
+    parser.add_argument("--pretrained-cyclegan", type=str, default=None)
+    parser.add_argument("--pretrained-encoder", type=str, default=None)
+    parser.add_argument("--pretrained-abmil", type=str, default=None)
+    parser.add_argument("--pretrained-classifier", type=str, default=None)
     parser.add_argument("--log-dir", type=str, default=str(PROJECT_ROOT / "outputs" / "logs" / "augmented_cyclegan"))
     parser.add_argument("--run-id", type=str, required=True)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -650,12 +662,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-augment", action="store_true")
+    parser.add_argument(
+        "--subset",
+        type=float,
+        default=None,
+        help="Use only X%% of labs from metadata for quick experiments.",
+    )
     parser.add_argument("--max-slide-count", type=int, default=None)
     parser.add_argument("--patch-retries", type=int, default=8)
+    parser.add_argument(
+        "--profile-steps",
+        action="store_true",
+        help="Log per-step CUDA memory usage and iteration time (may slow training).",
+    )
     parser.add_argument(
         "--amp",
         action="store_true",
         help="Enable torch.cuda.amp mixed precision when running on CUDA devices.",
+    )
+    parser.add_argument(
+        "--disable-identity-loss",
+        action="store_true",
+        help="Disable identity loss term (sets its weight to zero).",
     )
     parser.add_argument(
         "--reticulin-embedding-dir",
@@ -671,10 +699,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(**config_defaults)
     args = parser.parse_args(argv)
+
+    # Fill missing pretrained paths from the config defaults (supports legacy keys)
+    for arg_name, keys in [
+        ("pretrained_cyclegan", ["pretrained_cyclegan", "cyclegan_checkpoint"]),
+        ("pretrained_encoder", ["pretrained_encoder", "encoder_checkpoint"]),
+        ("pretrained_abmil", ["pretrained_abmil", "abmil_checkpoint"]),
+        ("pretrained_classifier", ["pretrained_classifier", "classifier_checkpoint"]),
+    ]:
+        current = getattr(args, arg_name)
+        if current is None or (isinstance(current, str) and not current.strip()):
+            for key in keys:
+                if key in config_defaults and config_defaults[key]:
+                    setattr(args, arg_name, config_defaults[key])
+                    break
     if args.reticulin_embedding_dir:
         args.reticulin_embedding_dir = str(resolve_path(args.reticulin_embedding_dir, allow_missing=True))
     if args.contrastive_negatives <= 0:
         raise ValueError("--contrastive-negatives must be positive.")
+    if args.subset is not None:
+        if args.subset <= 0 or args.subset > 100:
+            raise ValueError("--subset must be between 0 and 100 (exclusive of 0).")
     required = [
         "pretrained_cyclegan",
         "pretrained_encoder",
@@ -802,6 +847,7 @@ def train(args: argparse.Namespace) -> None:
 
     history: list[dict[str, float]] = []
 
+    step_idx = 0
     for epoch in range(1, args.epochs + 1):
         G_H2R.train()
         G_R2H.train()
@@ -819,6 +865,11 @@ def train(args: argparse.Namespace) -> None:
         }
         batches = 0
         for he_batch, ret_batch, grades, slide_ids in tqdm(loader, desc=f"Epoch {epoch}"):
+            step_idx += 1
+            if args.profile_steps and device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+                mem_start = torch.cuda.memory_allocated(device)
+                t_start = time.perf_counter()
             batches += 1
             he_batch = he_batch.to(device, non_blocking=True)
             ret_batch = ret_batch.to(device, non_blocking=True)
@@ -846,7 +897,14 @@ def train(args: argparse.Namespace) -> None:
                 )
 
                 cycle_loss = l1_loss(rec_he, he_batch) + l1_loss(rec_ret, ret_batch)
-                id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
+
+                if args.lambda_identity > 0:
+                    id_ret = G_H2R(ret_flat).view_as(ret_batch)
+                    id_he  = G_R2H(he_flat).view_as(he_batch)
+                    id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
+                else:
+                    id_loss = torch.zeros((), device=device)
+                # id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
 
             z_fake = extract_patch_features(feature_extractor, fake_ret, mean, std, require_grad=True)
             z_real = None
@@ -866,10 +924,11 @@ def train(args: argparse.Namespace) -> None:
                 assert z_real is not None
                 contrastive_loss = compute_contrastive_loss(z_real, z_fake, projector, args.temperature)
 
+            id_weight = 0.0 if args.disable_identity_loss else args.lambda_identity
             loss_G = (
                 adv_loss
                 + args.lambda_cycle * cycle_loss
-                + args.lambda_identity * id_loss
+                + id_weight * id_loss
                 + args.lambda_cls * cls_loss
                 + args.lambda_con * contrastive_loss
             )
@@ -896,6 +955,22 @@ def train(args: argparse.Namespace) -> None:
             else:
                 loss_D.backward()
                 opt_D.step()
+
+            if args.profile_steps and device.type == "cuda":
+                # Ensure all queued CUDA work is finished before measuring
+                torch.cuda.synchronize(device)
+                t_end = time.perf_counter()
+                mem_end = torch.cuda.memory_allocated(device)
+                mem_peak = torch.cuda.max_memory_allocated(device)
+                LOGGER.info(
+                    "Profile | epoch=%d step=%d | time=%.3fs | mem_start=%.1f MB | mem_end=%.1f MB | mem_peak=%.1f MB",
+                    epoch,
+                    step_idx,
+                    t_end - t_start,
+                    mem_start / (1024**2),
+                    mem_end / (1024**2),
+                    mem_peak / (1024**2),
+                )
 
             epoch_metrics["G"] += loss_G.item()
             epoch_metrics["D"] += loss_D.item()
