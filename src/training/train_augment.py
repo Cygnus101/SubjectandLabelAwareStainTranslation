@@ -140,6 +140,7 @@ class SlidePatchDataset(Dataset):
         max_slides: Optional[int] = None,
         patch_retries: int = 8,
         subset_pct: Optional[float] = None,
+        subset_order: str = "random",
     ) -> None:
         self.metadata_path = resolve_path(metadata_csv)
         self.patch_root = resolve_path(data_root or self.metadata_path.parent)
@@ -148,6 +149,7 @@ class SlidePatchDataset(Dataset):
         self.patch_retries = max(1, patch_retries)
         self.rng = random.Random(seed)
         self.subset_pct = subset_pct
+        self.subset_order = subset_order
         self.missing_patch_paths = 0
         self._missing_log_limit = 20
         self.entries = self._build_entries(max_slides)
@@ -193,9 +195,21 @@ class SlidePatchDataset(Dataset):
             unique_labs = df["lab_id"].unique().tolist()
             target = max(1, int(round(len(unique_labs) * (pct / 100.0))))
             if target < len(unique_labs):
-                selected = self.rng.sample(unique_labs, target)
+                if self.subset_order == "ascending":
+                    labs_sorted = sorted(unique_labs)
+                    selected = labs_sorted[:target]
+                elif self.subset_order == "descending":
+                    labs_sorted = sorted(unique_labs, reverse=True)
+                    selected = labs_sorted[:target]
+                else:
+                    selected = self.rng.sample(unique_labs, target)
                 df = df[df["lab_id"].isin(selected)]
-            LOGGER.info("Subset active: %.2f%% of labs -> %d labs", pct, df["lab_id"].nunique())
+            LOGGER.info(
+                "Subset active (%s): %.2f%% of labs -> %d labs",
+                self.subset_order,
+                pct,
+                df["lab_id"].nunique(),
+            )
         entries: list[SlideRecord] = []
         for lab_id, lab_df in df.groupby("lab_id"):
             he_df = lab_df[lab_df["type_norm"].str.contains("h&e", na=False)]
@@ -312,6 +326,7 @@ def build_loader(args: argparse.Namespace) -> tuple[SlidePatchDataset, DataLoade
         max_slides=args.max_slide_count,
         patch_retries=args.patch_retries,
         subset_pct=args.subset,
+        subset_order=args.subset_order,
     )
     loader = DataLoader(
         dataset,
@@ -342,6 +357,24 @@ def freeze_module(module: nn.Module) -> nn.Module:
     for param in module.parameters():
         param.requires_grad_(False)
     return module
+
+
+def grad_norm(module: nn.Module) -> float:
+    norms = [p.grad.norm().item() for p in module.parameters() if p.grad is not None]
+    return float(sum(norms) / len(norms)) if norms else 0.0
+
+
+def component_grad_norm(
+    loss: torch.Tensor | None, modules: Sequence[nn.Module], retain_graph: bool = True
+) -> float:
+    if loss is None or not isinstance(loss, torch.Tensor) or not loss.requires_grad:
+        return 0.0
+    params = [p for module in modules for p in module.parameters() if p.requires_grad]
+    if not params:
+        return 0.0
+    grads = torch.autograd.grad(loss, params, retain_graph=retain_graph, allow_unused=True)
+    norms = [g.norm().item() for g in grads if g is not None]
+    return float(sum(norms) / len(norms)) if norms else 0.0
 
 
 def _load_state_dict(module: nn.Module, checkpoint_path: Path, key: Optional[str] = None) -> None:
@@ -668,6 +701,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Use only X%% of labs from metadata for quick experiments.",
     )
+    parser.add_argument(
+        "--subset-order",
+        type=str,
+        choices=["random", "ascending", "descending"],
+        default="random",
+        help="When --subset is set, keep labs from the top/bottom (alphabetical) or sample randomly.",
+    )
     parser.add_argument("--max-slide-count", type=int, default=None)
     parser.add_argument("--patch-retries", type=int, default=8)
     parser.add_argument(
@@ -844,6 +884,7 @@ def train(args: argparse.Namespace) -> None:
     scaler_G = GradScaler(enabled=use_amp)
     scaler_D = GradScaler(enabled=use_amp)
     amp_context = autocast if use_amp else nullcontext
+    grad_modules = (G_H2R, G_R2H, projector)
 
     history: list[dict[str, float]] = []
 
@@ -925,13 +966,20 @@ def train(args: argparse.Namespace) -> None:
                 contrastive_loss = compute_contrastive_loss(z_real, z_fake, projector, args.temperature)
 
             id_weight = 0.0 if args.disable_identity_loss else args.lambda_identity
-            loss_G = (
-                adv_loss
-                + args.lambda_cycle * cycle_loss
-                + id_weight * id_loss
-                + args.lambda_cls * cls_loss
-                + args.lambda_con * contrastive_loss
-            )
+
+            weighted_adv = adv_loss
+            weighted_cycle = args.lambda_cycle * cycle_loss
+            weighted_identity = id_weight * id_loss
+            weighted_cls = args.lambda_cls * cls_loss
+            weighted_con = args.lambda_con * contrastive_loss
+
+            grad_adv = component_grad_norm(weighted_adv, grad_modules)
+            grad_cycle = component_grad_norm(weighted_cycle, grad_modules)
+            grad_identity = component_grad_norm(weighted_identity, grad_modules)
+            grad_cls = component_grad_norm(weighted_cls, grad_modules)
+            grad_con = component_grad_norm(weighted_con, grad_modules)
+
+            loss_G = weighted_adv + weighted_cycle + weighted_identity + weighted_cls + weighted_con
 
             opt_G.zero_grad(set_to_none=True)
             if use_amp:
@@ -955,6 +1003,19 @@ def train(args: argparse.Namespace) -> None:
             else:
                 loss_D.backward()
                 opt_D.step()
+
+            LOGGER.info(
+                "[GRADS] adv=%.6e | cycle=%.6e | identity=%.6e | cls=%.6e | con=%.6e || "
+                "G_H2R=%.6e | G_R2H=%.6e | Proj=%.6e",
+                grad_adv,
+                grad_cycle,
+                grad_identity,
+                grad_cls,
+                grad_con,
+                grad_norm(G_H2R),
+                grad_norm(G_R2H),
+                grad_norm(projector),
+            )
 
             if args.profile_steps and device.type == "cuda":
                 # Ensure all queued CUDA work is finished before measuring

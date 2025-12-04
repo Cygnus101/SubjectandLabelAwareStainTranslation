@@ -1,55 +1,69 @@
 from pathlib import Path
 
-labels_root = Path("outputs/yolo_masks/labels")  # or your labels root
+labels_root = Path("outputs/yolo_masks/labels")  # adjust if needed
 
-bad_files = []
+bad_entries = []
 
 for txt in labels_root.rglob("*.txt"):
-    with txt.open() as f:
-        for lineno, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue  # empty line = no object (YOLO can handle, but we can flag if whole file empty)
+    lines = txt.read_text().strip().splitlines()
+    if not lines:
+        continue
 
-            parts = line.split()
-            # At least: class + 3 (x,y) pairs => 1 + 3*2 = 7 values
-            if len(parts) < 7:
-                bad_files.append((txt, lineno, "too few values"))
-                continue
+    for lineno, line in enumerate(lines, start=1):
+        line = line.strip()
+        if not line:
+            continue
 
-            cls = parts[0]
-            coords = parts[1:]
+        parts = line.split()
+        cls = parts[0]
+        coords_str = parts[1:]
 
-            # 1) class index integer?
-            try:
-                c = int(cls)
-            except ValueError:
-                bad_files.append((txt, lineno, f"non-int class: {cls}"))
-                continue
-            if c not in (0, 1):  # you only have he/reticulin
-                bad_files.append((txt, lineno, f"out-of-range class: {c}"))
+        # 1) basic structure checks
+        try:
+            c = int(cls)
+        except ValueError:
+            bad_entries.append((txt, lineno, "non-int class"))
+            continue
+        if c < 0 or c > 10:  # you probably only use 0/1 anyway
+            bad_entries.append((txt, lineno, f"class out of range: {c}"))
+            continue
 
-            # 2) even number of coord values
-            if len(coords) % 2 != 0:
-                bad_files.append((txt, lineno, f"odd number of coords: {len(coords)}"))
-                continue
+        if len(coords_str) < 6 or len(coords_str) % 2 != 0:
+            bad_entries.append((txt, lineno, f"bad coord count: {len(coords_str)}"))
+            continue
 
-            # 3) coords in [0, 1] and finite
-            try:
-                vals = [float(v) for v in coords]
-            except ValueError:
-                bad_files.append((txt, lineno, "non-float coord"))
-                continue
+        # 2) coords as floats in [0,1]
+        try:
+            coords = [float(v) for v in coords_str]
+        except ValueError:
+            bad_entries.append((txt, lineno, "non-float coord"))
+            continue
 
-            for v in vals:
-                if not (0.0 <= v <= 1.0):
-                    bad_files.append((txt, lineno, f"coord out of range: {v}"))
-                    break
+        bad_coord = False
+        for v in coords:
+            if not (0.0 <= v <= 1.0):
+                bad_entries.append((txt, lineno, f"coord out of range: {v}"))
+                bad_coord = True
+                break
+        if bad_coord:
+            continue
 
-if bad_files:
+        # 3) bbox from polygon must have positive area
+        xs = coords[0::2]
+        ys = coords[1::2]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+
+        if x_max <= x_min or y_max <= y_min:
+            bad_entries.append(
+                (txt, lineno, f"degenerate bbox: [{x_min}, {y_min}, {x_max}, {y_max}]")
+            )
+            continue
+
+if bad_entries:
     print("Found potential bad labels:")
-    for p, ln, msg in bad_files[:50]:
+    for p, ln, msg in bad_entries[:200]:
         print(p, "line", ln, "->", msg)
-    print(f"... total bad entries: {len(bad_files)}")
+    print(f"... total bad entries: {len(bad_entries)}")
 else:
-    print("All labels look syntactically OK.")
+    print("All labels look structurally OK.")
