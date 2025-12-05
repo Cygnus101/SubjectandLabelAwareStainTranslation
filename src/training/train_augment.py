@@ -22,8 +22,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms as T
+from torchvision.utils import save_image
 from tqdm.auto import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -44,8 +45,8 @@ GRADE_PATTERN = re.compile(r"(\d+)")
 
 
 try:  # pragma: no cover - fall back to the repo-local definitions
-    from models.Backbone_model.CycleGANv3 import UNetGenerator as CycleGenerator  # type: ignore
-    from models.Backbone_model.CycleGANv3 import Discriminator as CycleDiscriminator  # type: ignore
+    from models.Backbone_model.CycleGAN import UNetGenerator as CycleGenerator  # type: ignore
+    from models.Backbone_model.CycleGAN import Discriminator as CycleDiscriminator  # type: ignore
 
 except:
     from models.Backbone_model.CycleGANv2 import UNetGenerator as CycleGenerator  # type: ignore
@@ -141,15 +142,24 @@ class SlidePatchDataset(Dataset):
         patch_retries: int = 8,
         subset_pct: Optional[float] = None,
         subset_order: str = "random",
+        legacy_roots: Optional[Sequence[Path]] = None,
     ) -> None:
         self.metadata_path = resolve_path(metadata_csv)
         self.patch_root = resolve_path(data_root or self.metadata_path.parent)
         self.patches_per_slide = patches_per_slide
-        self.transform = _build_patch_transform(image_size, augment)
+        self.train_transform = _build_patch_transform(image_size, augment)
+        self.eval_transform = _build_patch_transform(image_size, augment=False)
         self.patch_retries = max(1, patch_retries)
         self.rng = random.Random(seed)
         self.subset_pct = subset_pct
         self.subset_order = subset_order
+        self.legacy_roots: list[Path] = []
+        for root in legacy_roots or []:
+            try:
+                resolved = Path(root).expanduser().resolve()
+            except FileNotFoundError:
+                resolved = Path(root).expanduser()
+            self.legacy_roots.append(resolved)
         self.missing_patch_paths = 0
         self._missing_log_limit = 20
         self.entries = self._build_entries(max_slides)
@@ -161,9 +171,30 @@ class SlidePatchDataset(Dataset):
     def _normalize_path(self, raw: str) -> Path:
         normalized = raw.replace("\\", "/")
         path = Path(normalized)
+
+        # If it's an absolute path, try to remap from any legacy root to the current project layout.
         if path.is_absolute():
+            if path.exists():
+                return path
+            for legacy_root in self.legacy_roots:
+                try:
+                    relative = path.relative_to(legacy_root)
+                except ValueError:
+                    continue
+                remapped = (self.patch_root / relative).resolve()
+                if remapped.exists():
+                    return remapped
+            # No remap possible or remapped target missing; return original path.
             return path
-        return (self.patch_root / path).resolve()
+
+        candidate = (self.patch_root / path).resolve()
+        if candidate.exists():
+            return candidate
+        for legacy_root in self.legacy_roots:
+            alt = (legacy_root / path).resolve()
+            if alt.exists():
+                return alt
+        return candidate
 
     def _collect_valid_paths(self, raw_paths: Sequence[str]) -> list[Path]:
         paths: list[Path] = []
@@ -252,7 +283,7 @@ class SlidePatchDataset(Dataset):
     def __len__(self) -> int:
         return len(self.entries)
 
-    def _load_stack(self, paths: list[Path]) -> torch.Tensor:
+    def _load_stack(self, paths: list[Path], transform: Optional[T.Compose] = None) -> torch.Tensor:
         images: list[torch.Tensor] = []
         pool = list(paths)
         if not pool:
@@ -271,7 +302,8 @@ class SlidePatchDataset(Dataset):
             attempts += 1
             try:
                 with Image.open(path) as img:
-                    tensor = self.transform(img.convert("RGB"))
+                    tfm = transform or self.train_transform
+                    tensor = tfm(img.convert("RGB"))
             except (FileNotFoundError, UnidentifiedImageError, OSError) as exc:
                 LOGGER.warning("Failed to load patch %s (%s)", path, exc)
                 continue
@@ -280,12 +312,31 @@ class SlidePatchDataset(Dataset):
             raise RuntimeError(f"Unable to collect {self.patches_per_slide} patches from {paths[0].parent}")
         return torch.stack(images, dim=0)
 
-    def __getitem__(self, idx: int):
+    def get_slide(
+        self,
+        idx: int,
+        *,
+        deterministic: bool = False,
+    ):
         record = self.entries[idx]
-        he_stack = self._load_stack(record.he_paths)
-        ret_stack = self._load_stack(record.ret_paths)
+        tfm = self.eval_transform if deterministic else self.train_transform
+        he_stack = self._load_stack(record.he_paths, transform=tfm)
+        ret_stack = self._load_stack(record.ret_paths, transform=tfm)
         grade = torch.tensor(record.grade, dtype=torch.long)
         return he_stack, ret_stack, grade, record.ret_stain_id
+
+    def __getitem__(self, idx: int):
+        return self.get_slide(idx)
+
+    def filter_slides(self, allowed_ids: set[str]) -> int:
+        before = len(self.entries)
+        if before == 0:
+            return 0
+        self.entries = [entry for entry in self.entries if entry.ret_stain_id in allowed_ids]
+        removed = before - len(self.entries)
+        if not self.entries:
+            raise RuntimeError("Filtering removed all slides; check embedding bank coverage.")
+        return removed
 
 
 class SlideEmbeddingBank:
@@ -301,6 +352,10 @@ class SlideEmbeddingBank:
             raise KeyError(f"Slide '{slide_id}' missing from embedding bank.")
         return emb
 
+    @property
+    def slide_ids(self) -> list[str]:
+        return list(self._ids)
+
     def sample(self, exclude: set[str], k: int) -> torch.Tensor:
         candidates = [sid for sid in self._ids if sid not in exclude]
         if not candidates:
@@ -315,8 +370,8 @@ class SlideEmbeddingBank:
         return torch.stack(tensors, dim=0)
 
 
-def build_loader(args: argparse.Namespace) -> tuple[SlidePatchDataset, DataLoader]:
-    dataset = SlidePatchDataset(
+def build_dataset(args: argparse.Namespace) -> SlidePatchDataset:
+    return SlidePatchDataset(
         metadata_csv=Path(args.metadata),
         data_root=Path(args.data_root) if args.data_root else None,
         patches_per_slide=args.patches_per_slide,
@@ -327,16 +382,76 @@ def build_loader(args: argparse.Namespace) -> tuple[SlidePatchDataset, DataLoade
         patch_retries=args.patch_retries,
         subset_pct=args.subset,
         subset_order=args.subset_order,
+        legacy_roots=[Path(p) for p in getattr(args, "legacy_root", [])] if getattr(args, "legacy_root", None) else None,
     )
-    loader = DataLoader(
+
+
+def build_dataloader(
+    dataset: Dataset,
+    args: argparse.Namespace,
+    *,
+    shuffle: bool = True,
+) -> DataLoader:
+    return DataLoader(
         dataset,
         batch_size=args.batch_slides,
-        shuffle=True,
+        shuffle=shuffle,
         num_workers=args.num_workers,
         pin_memory=args.device.startswith("cuda") if args.device else False,
         drop_last=True,
     )
+
+
+def build_loader(args: argparse.Namespace) -> tuple[SlidePatchDataset, DataLoader]:
+    dataset = build_dataset(args)
+    loader = build_dataloader(dataset, args)
     return dataset, loader
+
+
+def build_split_loaders(
+    dataset: SlidePatchDataset,
+    args: argparse.Namespace,
+) -> dict[str, DataLoader | None]:
+    total = len(dataset)
+    if total < 3:
+        loader = build_dataloader(dataset, args)
+        return {"train": loader, "val": None, "test": None}
+    val_count = int(total * args.val_ratio)
+    test_count = int(total * args.test_ratio)
+    if val_count + test_count > total - 2:
+        # Ensure at least 2 slides remain for training.
+        shrink = (val_count + test_count) - (total - 2)
+        if shrink > 0:
+            if test_count >= shrink:
+                test_count -= shrink
+            else:
+                shrink -= test_count
+                test_count = 0
+                val_count = max(0, val_count - shrink)
+    train_count = total - val_count - test_count
+    generator = torch.Generator().manual_seed(args.seed)
+    perm = torch.randperm(total, generator=generator).tolist()
+    train_idx = perm[:train_count]
+    val_idx = perm[train_count : train_count + val_count]
+    test_idx = perm[train_count + val_count :]
+
+    subsets: dict[str, Subset | None] = {
+        "train": Subset(dataset, train_idx),
+        "val": Subset(dataset, val_idx) if val_idx else None,
+        "test": Subset(dataset, test_idx) if test_idx else None,
+    }
+
+    loaders: dict[str, DataLoader | None] = {}
+    for name, subset in subsets.items():
+        if subset is None or len(subset) == 0:  # type: ignore[arg-type]
+            loaders[name] = None
+            continue
+        loaders[name] = build_dataloader(
+            subset,
+            args,
+            shuffle=name == "train",
+        )
+    return loaders
 
 
 class ProjectionHead(nn.Module):
@@ -375,6 +490,102 @@ def component_grad_norm(
     grads = torch.autograd.grad(loss, params, retain_graph=retain_graph, allow_unused=True)
     norms = [g.norm().item() for g in grads if g is not None]
     return float(sum(norms) / len(norms)) if norms else 0.0
+
+
+def evaluate_split(
+    split_name: str,
+    loader: DataLoader | None,
+    *,
+    device: torch.device,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    feature_extractor: nn.Module,
+    abmil: ABMIL,
+    slide_classifier: SlideClassifier,
+    projector: ProjectionHead,
+    G_H2R: nn.Module,
+    embedding_bank: SlideEmbeddingBank,
+    args: argparse.Namespace,
+    criterion_cls: nn.Module,
+) -> dict[str, float]:
+    if loader is None or len(loader) == 0:
+        return {}
+    G_H2R.eval()
+    projector.eval()
+    total_loss_cls = 0.0
+    total_loss_con = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    with torch.no_grad():
+        for he_batch, ret_batch, grades, slide_ids in loader:
+            he_batch = he_batch.to(device, non_blocking=True)
+            ret_batch = ret_batch.to(device, non_blocking=True)
+            grades = grades.to(device, non_blocking=True)
+
+            he_flat = he_batch.view(-1, *he_batch.shape[2:])
+            fake_ret = G_H2R(he_flat).view_as(ret_batch)
+
+            z_fake = extract_patch_features(
+                feature_extractor, fake_ret, mean, std, require_grad=False
+            )
+            cls_loss, logits = compute_classification_loss(
+                z_fake, grades, abmil, slide_classifier, criterion_cls
+            )
+            contrastive_loss = compute_contrastive_loss_with_bank(
+                z_fake,
+                slide_ids,
+                embedding_bank,
+                projector,
+                args.contrastive_negatives,
+                args.temperature,
+            )
+            preds = logits.argmax(dim=1)
+            total_correct += (preds == grades).sum().item()
+            total_samples += grades.size(0)
+            total_loss_cls += cls_loss.item()
+            total_loss_con += contrastive_loss.item()
+
+    avg_cls = total_loss_cls / max(1, len(loader))
+    avg_con = total_loss_con / max(1, len(loader))
+    acc = total_correct / max(1, total_samples)
+    LOGGER.info(
+        "[%s] cls_loss=%.4f | con_loss=%.4f | acc=%.3f",
+        split_name,
+        avg_cls,
+        avg_con,
+        acc,
+    )
+    return {"cls": avg_cls, "con": avg_con, "acc": acc}
+
+
+def plot_metrics(history: list[dict[str, float]], out_path: Path) -> None:
+    if not history:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        LOGGER.warning("matplotlib not available; skipping metric plot.")
+        return
+
+    epochs = [row["epoch"] for row in history]
+    plt.figure(figsize=(8, 5))
+    train_cls = [row.get("train_cls", row.get("cls")) for row in history]
+    plt.plot(epochs, train_cls, label="train cls")
+    if any(row.get("val_cls") is not None for row in history):
+        plt.plot(epochs, [row.get("val_cls") for row in history], label="val cls")
+    if any(row.get("test_cls") is not None for row in history):
+        plt.plot(epochs, [row.get("test_cls") for row in history], label="test cls")
+    plt.xlabel("Epoch")
+    plt.ylabel("Classification Loss")
+    plt.title("Train/Val/Test Classification Loss")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.4)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    LOGGER.info("Saved metric plot to %s", out_path)
 
 
 def _load_state_dict(module: nn.Module, checkpoint_path: Path, key: Optional[str] = None) -> None:
@@ -662,6 +873,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise SystemExit(str(exc)) from exc
 
     parser = argparse.ArgumentParser(description="Augmented CycleGAN training", parents=[base_parser])
+    parser.add_argument(
+        "--legacy-root",
+        type=str,
+        action="append",
+        default=None,
+        help="Legacy absolute root directory to remap from (can be used multiple times).",
+    )
     parser.add_argument("--metadata", type=str, default=str(PROJECT_ROOT / "metadata.csv"))
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--batch-slides", type=int, default=2)
@@ -679,6 +897,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pretrained-abmil", type=str, default=None)
     parser.add_argument("--pretrained-classifier", type=str, default=None)
     parser.add_argument("--log-dir", type=str, default=str(PROJECT_ROOT / "outputs" / "logs" / "augmented_cyclegan"))
+    parser.add_argument(
+        "--samples-dir",
+        type=str,
+        default=str(PROJECT_ROOT / "outputs" / "samples" / "augmented_cyclegan"),
+        help="Directory where epoch sample grids are stored.",
+    )
     parser.add_argument("--run-id", type=str, required=True)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=256)
@@ -693,6 +917,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--proj-out-dim", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument(
+        "--save-samples-every",
+        type=int,
+        default=1,
+        help="Save deterministic sample grids every N epochs.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument(
@@ -707,6 +937,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=["random", "ascending", "descending"],
         default="random",
         help="When --subset is set, keep labs from the top/bottom (alphabetical) or sample randomly.",
+    )
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of slides reserved for validation (0-1 range).",
+    )
+    parser.add_argument(
+        "--test-ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of slides reserved for testing (0-1 range).",
     )
     parser.add_argument("--max-slide-count", type=int, default=None)
     parser.add_argument("--patch-retries", type=int, default=8)
@@ -760,6 +1002,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.subset is not None:
         if args.subset <= 0 or args.subset > 100:
             raise ValueError("--subset must be between 0 and 100 (exclusive of 0).")
+    if args.val_ratio < 0 or args.test_ratio < 0 or args.val_ratio >= 1 or args.test_ratio >= 1:
+        raise ValueError("--val-ratio and --test-ratio must be within [0, 1).")
+    if args.val_ratio + args.test_ratio >= 0.95:
+        raise ValueError("val_ratio + test_ratio must be less than 0.95 to leave room for training.")
     required = [
         "pretrained_cyclegan",
         "pretrained_encoder",
@@ -780,6 +1026,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.metadata = str(resolve_path(args.metadata))
     if args.data_root:
         args.data_root = str(resolve_path(args.data_root, allow_missing=True))
+    args.log_dir = str(resolve_path(args.log_dir, allow_missing=True))
+    args.samples_dir = str(resolve_path(args.samples_dir, allow_missing=True))
+    if args.legacy_root:
+        # Resolve legacy roots but allow them to be missing on the current machine;
+        # we only use them for prefix-stripping and remapping.
+        args.legacy_root = [
+            str(resolve_path(path, allow_missing=True)) for path in args.legacy_root
+        ]
     return args
 
 
@@ -811,22 +1065,46 @@ def train(args: argparse.Namespace) -> None:
     device = determine_device(args.device)
     args.device = device.type if device.index is None else f"{device.type}:{device.index}"
 
-    run_dir = resolve_path(args.log_dir, allow_missing=True) / args.run_id
+    log_root = resolve_path(args.log_dir, allow_missing=True)
+    samples_root = resolve_path(args.samples_dir, allow_missing=True)
+    run_dir = log_root / args.run_id
+    samples_dir = samples_root / args.run_id
     setup_logging(run_dir)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    dataset, loader = build_loader(args)
-    LOGGER.info("Slides available: %d", len(dataset))
-    embedding_bank: SlideEmbeddingBank | None = None
-    if args.reticulin_embedding_dir:
-        embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset)
-        LOGGER.info(
-            "Using embedding bank for contrastive loss with %d negatives per slide.",
-            args.contrastive_negatives,
+    if not args.reticulin_embedding_dir:
+        raise ValueError(
+            "Slide-level contrastive training now requires --reticulin-embedding-dir "
+            "with precomputed reticulin embeddings."
         )
+    dataset = build_dataset(args)
+    LOGGER.info("Slides available before filtering: %d", len(dataset))
+    embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset)
+    allowed_ids = set(embedding_bank.slide_ids)
+    removed = dataset.filter_slides(allowed_ids)
+    if removed:
+        LOGGER.info("Filtered %d slide(s) missing embeddings; %d remain.", removed, len(dataset))
+
+    loaders = build_split_loaders(dataset, args)
+    train_loader = loaders["train"]
+    if train_loader is None:
+        raise RuntimeError("Training loader is empty after filtering; cannot proceed.")
+    val_loader = loaders.get("val")
+    test_loader = loaders.get("test")
+    LOGGER.info(
+        "Loader sizes | train: %s | val: %s | test: %s",
+        len(train_loader),
+        len(val_loader) if val_loader is not None else 0,
+        len(test_loader) if test_loader is not None else 0,
+    )
+
+    LOGGER.info(
+        "Using embedding bank for contrastive loss with %d negatives per slide.",
+        args.contrastive_negatives,
+    )
 
     feature_extractor = build_feature_extractor(args, device)
     mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, -1, 1, 1)
@@ -886,7 +1164,17 @@ def train(args: argparse.Namespace) -> None:
     amp_context = autocast if use_amp else nullcontext
     grad_modules = (G_H2R, G_R2H, projector)
 
+    samples_dir.mkdir(parents=True, exist_ok=True)
+
     history: list[dict[str, float]] = []
+    preview_he: torch.Tensor | None = None
+    preview_ret: torch.Tensor | None = None
+    try:
+        he_stack, ret_stack, _, _ = dataset.get_slide(0, deterministic=True)
+        preview_he = he_stack[:1].to(device, non_blocking=True)
+        preview_ret = ret_stack[:1].to(device, non_blocking=True)
+    except Exception as exc:
+        LOGGER.warning("Unable to collect preview samples (%s); skipping sample grids.", exc)
 
     step_idx = 0
     for epoch in range(1, args.epochs + 1):
@@ -905,7 +1193,7 @@ def train(args: argparse.Namespace) -> None:
             "adv": 0.0,
         }
         batches = 0
-        for he_batch, ret_batch, grades, slide_ids in tqdm(loader, desc=f"Epoch {epoch}"):
+        for he_batch, ret_batch, grades, slide_ids in tqdm(train_loader, desc=f"Epoch {epoch}"):
             step_idx += 1
             if args.profile_steps and device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
@@ -948,22 +1236,15 @@ def train(args: argparse.Namespace) -> None:
                 # id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
 
             z_fake = extract_patch_features(feature_extractor, fake_ret, mean, std, require_grad=True)
-            z_real = None
-            if embedding_bank is None:
-                z_real = extract_patch_features(feature_extractor, ret_batch, mean, std, require_grad=False)
             cls_loss, _ = compute_classification_loss(z_fake, grades, abmil, slide_classifier, criterion_cls)
-            if embedding_bank is not None:
-                contrastive_loss = compute_contrastive_loss_with_bank(
-                    z_fake,
-                    slide_ids,
-                    embedding_bank,
-                    projector,
-                    args.contrastive_negatives,
-                    args.temperature,
-                )
-            else:
-                assert z_real is not None
-                contrastive_loss = compute_contrastive_loss(z_real, z_fake, projector, args.temperature)
+            contrastive_loss = compute_contrastive_loss_with_bank(
+                z_fake,
+                slide_ids,
+                embedding_bank,
+                projector,
+                args.contrastive_negatives,
+                args.temperature,
+            )
 
             id_weight = 0.0 if args.disable_identity_loss else args.lambda_identity
 
@@ -1056,10 +1337,98 @@ def train(args: argparse.Namespace) -> None:
             epoch_metrics["con"],
         )
 
-        history.append({"epoch": epoch, **epoch_metrics})
+        val_metrics = evaluate_split(
+            "val",
+            val_loader,
+            device=device,
+            mean=mean,
+            std=std,
+            feature_extractor=feature_extractor,
+            abmil=abmil,
+            slide_classifier=slide_classifier,
+            projector=projector,
+            G_H2R=G_H2R,
+            embedding_bank=embedding_bank,
+            args=args,
+            criterion_cls=criterion_cls,
+        )
+        test_metrics = evaluate_split(
+            "test",
+            test_loader,
+            device=device,
+            mean=mean,
+            std=std,
+            feature_extractor=feature_extractor,
+            abmil=abmil,
+            slide_classifier=slide_classifier,
+            projector=projector,
+            G_H2R=G_H2R,
+            embedding_bank=embedding_bank,
+            args=args,
+            criterion_cls=criterion_cls,
+        )
+        G_H2R.train()
+        G_R2H.train()
+        projector.train()
+
+        history.append(
+            {
+                "epoch": epoch,
+                **epoch_metrics,
+                "val_cls": val_metrics.get("cls") if val_metrics else None,
+                "val_con": val_metrics.get("con") if val_metrics else None,
+                "val_acc": val_metrics.get("acc") if val_metrics else None,
+                "test_cls": test_metrics.get("cls") if test_metrics else None,
+                "test_con": test_metrics.get("con") if test_metrics else None,
+                "test_acc": test_metrics.get("acc") if test_metrics else None,
+            }
+        )
         history_path = run_dir / "history.json"
         with history_path.open("w", encoding="utf-8") as fp:
             json.dump(history, fp, indent=2)
+
+        if (
+            preview_he is not None
+            and preview_ret is not None
+            and args.save_samples_every > 0
+            and epoch % args.save_samples_every == 0
+        ):
+            G_H2R.eval()
+            G_R2H.eval()
+            with torch.no_grad():
+                he_sample = preview_he
+                ret_sample = preview_ret
+                he_flat = he_sample.view(-1, *he_sample.shape[2:])
+                ret_flat = ret_sample.view(-1, *ret_sample.shape[2:])
+                fake_ret_sample = G_H2R(he_flat).view_as(he_sample)
+                fake_he_sample = G_R2H(ret_flat).view_as(ret_sample)
+            he_pair = torch.cat(
+                [
+                    he_sample.view(-1, *he_sample.shape[2:]),
+                    fake_ret_sample.view(-1, *fake_ret_sample.shape[2:]),
+                ],
+                dim=0,
+            )
+            ret_pair = torch.cat(
+                [
+                    ret_sample.view(-1, *ret_sample.shape[2:]),
+                    fake_he_sample.view(-1, *fake_he_sample.shape[2:]),
+                ],
+                dim=0,
+            )
+            save_image(
+                he_pair * 0.5 + 0.5,
+                str(samples_dir / f"he_to_ret_epoch{epoch}.jpg"),
+                nrow=he_sample.shape[1],
+            )
+            save_image(
+                ret_pair * 0.5 + 0.5,
+                str(samples_dir / f"ret_to_he_epoch{epoch}.jpg"),
+                nrow=ret_sample.shape[1],
+            )
+            G_H2R.train()
+            G_R2H.train()
+            projector.train()
 
         if epoch % args.save_every == 0 or epoch == args.epochs:
             save_checkpoints(
@@ -1072,6 +1441,7 @@ def train(args: argparse.Namespace) -> None:
                 },
             )
 
+    plot_metrics(history, run_dir / "metrics.png")
     LOGGER.info("Training complete. History saved to %s", run_dir / "history.json")
 
 

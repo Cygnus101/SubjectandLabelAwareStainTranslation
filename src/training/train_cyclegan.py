@@ -41,7 +41,12 @@ PROJECT_ROOT = get_project_root()
 
 # --- Import your custom modules ---
 from src.models.Backbone_model.CycleGANv3 import UNetGenerator, Discriminator
-from data.build_cyclegan_dataset import make_loaders_from_metadata, METADATA_CSV, BATCH_SIZE
+from data.build_cyclegan_dataset import (
+    make_loaders_from_metadata,
+    METADATA_CSV,
+    BATCH_SIZE,
+    DEFAULT_IMAGE_SIZE,
+)
 
 DEFAULT_OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 DEFAULT_CHECKPOINTS_DIR = DEFAULT_OUTPUTS_DIR / "checkpoints" / "cyclegan"
@@ -342,6 +347,8 @@ def main(args):
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         persistent_workers=persistent_workers,
         subset_pct=args.subset,
+        subset_order=args.subset_order,
+        image_size=args.image_size,
         legacy_roots=args.legacy_root,
     )
     logging.info(f"Train batches: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
@@ -665,6 +672,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=4, help="Ignored if --num-workers 0")
     parser.add_argument("--subset", type=float, default=None, help="Use only X%% of metadata (for quick runs)")
+    parser.add_argument(
+        "--subset-order",
+        type=str,
+        choices=["random", "ascending", "descending"],
+        default="random",
+        help="When subsetting labs, keep alphabetical top/bottom or sample randomly.",
+    )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=DEFAULT_IMAGE_SIZE,
+        help="Target square size (pixels) for training patches.",
+    )
 
     # Training
     parser.add_argument("--run-id", type=str, required=True, help="Unique run name")

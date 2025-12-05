@@ -42,6 +42,7 @@ PREFETCH_FACTOR = 4
 PIN_MEMORY = True
 PERSISTENT_WORKERS = NUM_WORKERS > 0
 DROP_LAST = True
+DEFAULT_IMAGE_SIZE = 256
 
 TRAIN_RATIO = 0.70
 VAL_RATIO   = 0.15
@@ -60,36 +61,43 @@ logging.basicConfig(
 logger = logging.getLogger("dataloader")
 
 # ---------- transforms ----------
-def ensure_512(img: Image.Image) -> Image.Image:
-    """Guarantee image is exactly 512x512 (crop+pad if needed)."""
-    if img.size == (512, 512):
+def ensure_size(img: Image.Image, target: int) -> Image.Image:
+    """Guarantee image is exactly target x target (crop+pad if needed)."""
+    if img.size == (target, target):
         return img
     w, h = img.size
-    cw, ch = min(w, 512), min(h, 512)
+    cw, ch = min(w, target), min(h, target)
     img = T.CenterCrop((ch, cw))(img)
-    pad_w, pad_h = 512 - img.size[0], 512 - img.size[1]
+    pad_w, pad_h = target - img.size[0], target - img.size[1]
     if pad_w > 0 or pad_h > 0:
         img = T.Pad((0, 0, pad_w, pad_h), fill=0)(img)
+    if img.size != (target, target):
+        img = img.resize((target, target), Image.BILINEAR)
     return img
 
 def random_quadrant_rotation(img: Image.Image) -> Image.Image:
     """Rotate by 0, 90, 180, or 270 degrees randomly."""
     return img.rotate(random.choice((0, 90, 180, 270)))
 
-train_tf = T.Compose([
-    T.Lambda(ensure_512),
-    T.RandomHorizontalFlip(0.5),
-    T.RandomVerticalFlip(0.5),
-    T.Lambda(random_quadrant_rotation),
-    T.ToTensor(),
-    T.Normalize((0.5,)*3, (0.5,)*3),
-])
+def build_transforms(image_size: int) -> Tuple[T.Compose, T.Compose]:
+    def _ensure(img: Image.Image) -> Image.Image:
+        return ensure_size(img, image_size)
 
-eval_tf = T.Compose([
-    T.Lambda(ensure_512),
-    T.ToTensor(),
-    T.Normalize((0.5,)*3, (0.5,)*3),
-])
+    train_tf = T.Compose([
+        T.Lambda(_ensure),
+        T.RandomHorizontalFlip(0.5),
+        T.RandomVerticalFlip(0.5),
+        T.Lambda(random_quadrant_rotation),
+        T.ToTensor(),
+        T.Normalize((0.5,) * 3, (0.5,) * 3),
+    ])
+
+    eval_tf = T.Compose([
+        T.Lambda(_ensure),
+        T.ToTensor(),
+        T.Normalize((0.5,) * 3, (0.5,) * 3),
+    ])
+    return train_tf, eval_tf
 
 # ---------- helpers ----------
 def _abs_path(rel_path: str, roots: Optional[Sequence[Path]] = None) -> str:
@@ -109,6 +117,12 @@ def _abs_path(rel_path: str, roots: Optional[Sequence[Path]] = None) -> str:
             return str(candidate)
 
     return str(resolve_project_path(rel_path, allow_missing=True))
+
+def _detect_lab_column(df: pd.DataFrame) -> Optional[str]:
+    for candidate in ["Lab No.", "lab_id", "Lab_No", "lab", "patient_id"]:
+        if candidate in df.columns:
+            return candidate
+    return None
 
 def _split_by_group(paths: List[str], groups: List[str],
                     train_ratio: float, val_ratio: float, seed: int):
@@ -225,6 +239,8 @@ def make_loaders_from_metadata(
     train_ratio: float = TRAIN_RATIO,
     val_ratio: float = VAL_RATIO,
     subset_pct: Optional[float] = None,
+    subset_order: str = "random",
+    image_size: int = DEFAULT_IMAGE_SIZE,
     legacy_roots: Optional[Sequence[str]] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
 
@@ -239,12 +255,51 @@ def make_loaders_from_metadata(
     he_df  = df[df["type"] == "H&E"].copy()
     ret_df = df[df["type"].str.lower().str.contains("reticulin")].copy()
 
-    if subset_pct is not None:
+    lab_col = _detect_lab_column(df)
+    subset_via_lab = False
+    if subset_pct is not None and lab_col is not None:
+        labs = df[lab_col].astype(str).str.strip()
+        labs = labs[labs.astype(bool)]
+        unique_labs = labs.unique().tolist()
+        if unique_labs:
+            pct = max(0.0, min(100.0, float(subset_pct)))
+            target = max(1, int(round(len(unique_labs) * (pct / 100.0))))
+            if target < len(unique_labs):
+                if subset_order == "ascending":
+                    selected = sorted(unique_labs)[:target]
+                elif subset_order == "descending":
+                    selected = sorted(unique_labs, reverse=True)[:target]
+                else:
+                    rng = random.Random(seed)
+                    selected = rng.sample(unique_labs, target)
+            else:
+                selected = unique_labs
+            df = df[df[lab_col].astype(str).str.strip().isin(selected)]
+            subset_via_lab = True
+            logger.info(
+                "Subset active (%s): %.2f%% of labs -> %d labs",
+                subset_order,
+                pct,
+                len(selected),
+            )
+        else:
+            logger.warning("Subset requested but lab column %s is empty.", lab_col)
+
+    he_df  = df[df["type"] == "H&E"].copy()
+    ret_df = df[df["type"].str.lower().str.contains("reticulin")].copy()
+
+    if subset_pct is not None and not subset_via_lab:
         total = len(df)
         subset_total = max(2, int(round(total * (subset_pct / 100.0))))
-        per_stain = subset_total // 2
+        per_stain = max(1, subset_total // 2)
         he_df = he_df.sample(n=min(per_stain, len(he_df)), random_state=seed)
         ret_df = ret_df.sample(n=min(per_stain, len(ret_df)), random_state=seed)
+        logger.info(
+            "Subset active (random rows): %.2f%% of rows -> %d H&E / %d Reticulin samples",
+            subset_pct,
+            len(he_df),
+            len(ret_df),
+        )
 
     he_paths  = he_df["abs_path"].tolist()
     ret_paths = ret_df["abs_path"].tolist()
@@ -259,6 +314,8 @@ def make_loaders_from_metadata(
 
     he_split  = _split_by_group(he_paths,  he_groups,  train_ratio, val_ratio, seed)
     ret_split = _split_by_group(ret_paths, ret_groups, train_ratio, val_ratio, seed)
+
+    train_tf, eval_tf = build_transforms(image_size)
 
     def _mk(split: str, train: bool):
         ds = HEToReticulinFromMetadata(
@@ -288,9 +345,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CycleGAN dataloaders from metadata")
     parser.add_argument("--subset", type=float, default=None,
                         help="Use only the first X percent of rows in metadata.csv")
+    parser.add_argument(
+        "--subset-order",
+        type=str,
+        choices=["random", "ascending", "descending"],
+        default="random",
+        help="Subset labs deterministically (ascending/descending) or randomly.",
+    )
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     args = parser.parse_args()
 
-    train_loader, val_loader, test_loader = make_loaders_from_metadata(subset_pct=args.subset)
+    train_loader, val_loader, test_loader = make_loaders_from_metadata(
+        subset_pct=args.subset,
+        subset_order=args.subset_order,
+        image_size=args.image_size,
+    )
     he, ret, meta = next(iter(train_loader))
     print("H&E batch:", he.shape, "Reticulin batch:", ret.shape)
     print("Example H&E path:", meta["he_path"][0])
