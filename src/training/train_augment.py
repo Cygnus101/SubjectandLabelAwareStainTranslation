@@ -44,11 +44,11 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 GRADE_PATTERN = re.compile(r"(\d+)")
 
 
-try:  # pragma: no cover - fall back to the repo-local definitions
+try:  # pragma: no cover - prefer the v3 architecture used in main CycleGAN training
     from models.Backbone_model.CycleGAN import UNetGenerator as CycleGenerator  # type: ignore
     from models.Backbone_model.CycleGAN import Discriminator as CycleDiscriminator  # type: ignore
-
-except:
+except Exception:
+    # Fallback to v2 if v3 is not available on this machine
     from models.Backbone_model.CycleGANv2 import UNetGenerator as CycleGenerator  # type: ignore
     from models.Backbone_model.CycleGANv2 import Discriminator as CycleDiscriminator  # type: ignore
 
@@ -351,6 +351,10 @@ class SlideEmbeddingBank:
         if emb is None:
             raise KeyError(f"Slide '{slide_id}' missing from embedding bank.")
         return emb
+
+    def maybe_get(self, slide_id: str) -> torch.Tensor | None:
+        """Return the embedding tensor for slide_id, or None if missing."""
+        return self._slide_embeddings.get(slide_id)
 
     @property
     def slide_ids(self) -> list[str]:
@@ -713,29 +717,47 @@ def compute_contrastive_loss_with_bank(
     if batch != len(slide_ids):
         raise ValueError("slide_ids length must match batch size.")
     device = z_fake.device
-    e_fake = z_fake.mean(dim=1)
+
+    # Collect only those slides that have an embedding in the bank.
+    valid_indices: list[int] = []
+    positive_embeddings: list[torch.Tensor] = []
+    valid_ids: list[str] = []
+    for idx, sid in enumerate(slide_ids):
+        emb = bank.maybe_get(sid)
+        if emb is None:
+            continue
+        valid_indices.append(idx)
+        positive_embeddings.append(emb)
+        valid_ids.append(sid)
+
+    # If no slides in this batch have embeddings, return zero loss (no contrastive signal).
+    if not valid_indices:
+        return torch.zeros((), device=device)
+
+    e_fake_all = z_fake.mean(dim=1)
+    e_fake = e_fake_all[valid_indices]
     q_fake = F.normalize(projector(e_fake), dim=1)
-    positives: list[torch.Tensor] = []
-    batch_ids = list(slide_ids)
-    for sid in batch_ids:
-        positives.append(bank.get(sid))
-    pos_tensor = torch.stack(positives, dim=0).to(device)
+
+    pos_tensor = torch.stack(positive_embeddings, dim=0).to(device)
     q_pos = F.normalize(projector(pos_tensor), dim=1)
 
     losses: list[torch.Tensor] = []
-    exclude_batch = set(batch_ids)
-    for idx, sid in enumerate(batch_ids):
+    # Exclude all valid ids from being used as negatives for any anchor.
+    exclude_batch = set(valid_ids)
+    for local_idx, sid in enumerate(valid_ids):
         exclude = set(exclude_batch)
         exclude.add(sid)
         negatives = bank.sample(exclude, num_negatives).to(device)
         q_neg = F.normalize(projector(negatives), dim=1)
-        anchor = q_fake[idx]
-        pos = q_pos[idx]
+
+        anchor = q_fake[local_idx]
+        pos = q_pos[local_idx]
         pos_logit = torch.dot(anchor, pos) / temperature
         neg_logits = (q_neg @ anchor) / temperature
         logits = torch.cat([pos_logit.unsqueeze(0), neg_logits], dim=0)
         loss = -(pos_logit - torch.logsumexp(logits, dim=0))
         losses.append(loss)
+
     return torch.stack(losses).mean()
 
 
@@ -884,10 +906,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--batch-slides", type=int, default=2)
     parser.add_argument("--patches-per-slide", type=int, default=32)
-    parser.add_argument("--lambda-cycle", type=float, default=10.0)
-    parser.add_argument("--lambda-identity", type=float, default=5.0)
-    parser.add_argument("--lambda-cls", type=float, default=1.0)
-    parser.add_argument("--lambda-con", type=float, default=1.0)
+    parser.add_argument("--lambda-cycle", type=float, default=50.0)
+    parser.add_argument("--lambda-identity", type=float, default=25.0)
+    parser.add_argument("--lambda-cls", type=float, default=5.0)
+    parser.add_argument("--lambda-con", type=float, default=5.0)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr-gen", type=float, default=2e-4)
     parser.add_argument("--lr-disc", type=float, default=2e-4)
@@ -1081,12 +1103,12 @@ def train(args: argparse.Namespace) -> None:
             "with precomputed reticulin embeddings."
         )
     dataset = build_dataset(args)
-    LOGGER.info("Slides available before filtering: %d", len(dataset))
+    LOGGER.info("Slides available: %d", len(dataset))
     embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset)
-    allowed_ids = set(embedding_bank.slide_ids)
-    removed = dataset.filter_slides(allowed_ids)
-    if removed:
-        LOGGER.info("Filtered %d slide(s) missing embeddings; %d remain.", removed, len(dataset))
+    LOGGER.info(
+        "Embedding bank covers %d slide(s); slides without embeddings will be skipped in contrastive loss.",
+        len(embedding_bank.slide_ids),
+    )
 
     loaders = build_split_loaders(dataset, args)
     train_loader = loaders["train"]
@@ -1171,8 +1193,9 @@ def train(args: argparse.Namespace) -> None:
     preview_ret: torch.Tensor | None = None
     try:
         he_stack, ret_stack, _, _ = dataset.get_slide(0, deterministic=True)
-        preview_he = he_stack[:1].to(device, non_blocking=True)
-        preview_ret = ret_stack[:1].to(device, non_blocking=True)
+        # he_stack: [P, C, H, W] -> add a slide dimension -> [1, P, C, H, W]
+        preview_he = he_stack.unsqueeze(0).to(device, non_blocking=True)
+        preview_ret = ret_stack.unsqueeze(0).to(device, non_blocking=True)
     except Exception as exc:
         LOGGER.warning("Unable to collect preview samples (%s); skipping sample grids.", exc)
 

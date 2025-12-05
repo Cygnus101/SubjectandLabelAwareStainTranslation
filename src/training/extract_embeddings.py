@@ -272,6 +272,4 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 if __name__ == "__main__":
     main()
 
-
-if __name__ == "__main__":
-    main()
+# End of src/training/extract_embeddings.py
