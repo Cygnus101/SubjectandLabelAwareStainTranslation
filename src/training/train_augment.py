@@ -143,6 +143,7 @@ class SlidePatchDataset(Dataset):
         subset_pct: Optional[float] = None,
         subset_order: str = "random",
         legacy_roots: Optional[Sequence[Path]] = None,
+        entries: Optional[list[SlideRecord]] = None,
     ) -> None:
         self.metadata_path = resolve_path(metadata_csv)
         self.patch_root = resolve_path(data_root or self.metadata_path.parent)
@@ -162,7 +163,10 @@ class SlidePatchDataset(Dataset):
             self.legacy_roots.append(resolved)
         self.missing_patch_paths = 0
         self._missing_log_limit = 20
-        self.entries = self._build_entries(max_slides)
+        if entries is not None:
+            self.entries = entries
+        else:
+            self.entries = self._build_entries(max_slides)
         if not self.entries:
             raise RuntimeError("No slides with both H&E and Reticulin patches were found.")
         if self.missing_patch_paths:
@@ -338,6 +342,57 @@ class SlidePatchDataset(Dataset):
             raise RuntimeError("Filtering removed all slides; check embedding bank coverage.")
         return removed
 
+    def serialize_entries(self, indices: Sequence[int]) -> list[dict[str, Any]]:
+        return [self._serialize_record(self.entries[i]) for i in indices]
+
+    @staticmethod
+    def _serialize_record(record: SlideRecord) -> dict[str, Any]:
+        return {
+            "lab_id": record.lab_id,
+            "he_stain_id": record.he_stain_id,
+            "ret_stain_id": record.ret_stain_id,
+            "grade": record.grade,
+            "he_paths": [str(p) for p in record.he_paths],
+            "ret_paths": [str(p) for p in record.ret_paths],
+        }
+
+    @staticmethod
+    def _deserialize_record(payload: dict[str, Any]) -> SlideRecord:
+        return SlideRecord(
+            lab_id=payload["lab_id"],
+            he_stain_id=payload["he_stain_id"],
+            ret_stain_id=payload["ret_stain_id"],
+            grade=int(payload["grade"]),
+            he_paths=[Path(p) for p in payload["he_paths"]],
+            ret_paths=[Path(p) for p in payload["ret_paths"]],
+        )
+
+    @classmethod
+    def from_serialized(
+        cls,
+        entries: Sequence[dict[str, Any]],
+        args: argparse.Namespace,
+    ) -> SlidePatchDataset:
+        records = [cls._deserialize_record(entry) for entry in entries]
+        legacy_roots = (
+            [Path(p) for p in getattr(args, "legacy_root", [])]
+            if getattr(args, "legacy_root", None)
+            else None
+        )
+        return cls(
+            metadata_csv=Path(args.metadata),
+            data_root=Path(args.data_root) if args.data_root else None,
+            patches_per_slide=args.patches_per_slide,
+            image_size=args.image_size,
+            augment=not args.no_augment,
+            seed=args.seed,
+            patch_retries=args.patch_retries,
+            subset_pct=None,
+            subset_order=args.subset_order,
+            legacy_roots=legacy_roots,
+            entries=records,
+        )
+
 
 class SlideEmbeddingBank:
     def __init__(self, slide_embeddings: dict[str, torch.Tensor]) -> None:
@@ -415,11 +470,16 @@ def build_loader(args: argparse.Namespace) -> tuple[SlidePatchDataset, DataLoade
 def build_split_loaders(
     dataset: SlidePatchDataset,
     args: argparse.Namespace,
-) -> dict[str, DataLoader | None]:
+    *,
+    return_indices: bool = False,
+) -> tuple[dict[str, DataLoader | None], dict[str, list[int]]] | dict[str, DataLoader | None]:
     total = len(dataset)
     if total < 3:
         loader = build_dataloader(dataset, args)
-        return {"train": loader, "val": None, "test": None}
+        result = {"train": loader, "val": None, "test": None}
+        if return_indices:
+            return result, {"train": list(range(total)), "val": [], "test": []}
+        return result
     val_count = int(total * args.val_ratio)
     test_count = int(total * args.test_ratio)
     if val_count + test_count > total - 2:
@@ -455,6 +515,8 @@ def build_split_loaders(
             args,
             shuffle=name == "train",
         )
+    if return_indices:
+        return loaders, {"train": train_idx, "val": val_idx, "test": test_idx}
     return loaders
 
 
@@ -494,6 +556,38 @@ def component_grad_norm(
     grads = torch.autograd.grad(loss, params, retain_graph=retain_graph, allow_unused=True)
     norms = [g.norm().item() for g in grads if g is not None]
     return float(sum(norms) / len(norms)) if norms else 0.0
+
+
+def _load_cache(path_str: Optional[str], label: str, no_cache: bool):
+    if not path_str or no_cache:
+        return None
+    cache_path = Path(path_str)
+    if not cache_path.exists():
+        return None
+    LOGGER.info("Loading cached %s from %s", label, cache_path)
+    try:
+        # For PyTorch 2.6+, default weights_only=True breaks loading custom classes
+        return torch.load(cache_path, weights_only=False)
+    except TypeError:
+        # Older PyTorch versions do not support weights_only
+        return torch.load(cache_path)
+    except Exception as exc:
+        LOGGER.warning(
+            "Failed to load cached %s from %s (%s); ignoring cache and recomputing.",
+            label,
+            cache_path,
+            exc,
+        )
+        return None
+
+
+def _save_cache(obj: Any, path_str: Optional[str], label: str, no_cache: bool) -> None:
+    if not path_str or no_cache:
+        return
+    cache_path = Path(path_str)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(obj, cache_path)
+    LOGGER.info("Saved %s cache to %s", label, cache_path)
 
 
 def evaluate_split(
@@ -908,8 +1002,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--patches-per-slide", type=int, default=32)
     parser.add_argument("--lambda-cycle", type=float, default=50.0)
     parser.add_argument("--lambda-identity", type=float, default=25.0)
-    parser.add_argument("--lambda-cls", type=float, default=5.0)
-    parser.add_argument("--lambda-con", type=float, default=5.0)
+    parser.add_argument("--lambda-cls", type=float, default=0.0)
+    parser.add_argument("--lambda-con", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr-gen", type=float, default=2e-4)
     parser.add_argument("--lr-disc", type=float, default=2e-4)
@@ -1001,6 +1095,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=32,
         help="Number of negative samples drawn from the real embedding bank per slide.",
     )
+    parser.add_argument(
+        "--cache-embedding-bank",
+        type=str,
+        default=None,
+        help="Path to cache the computed embedding bank (torch.save format).",
+    )
+    parser.add_argument(
+        "--cache-index",
+        type=str,
+        default=None,
+        help="Path to cache serialized slide indices/splits.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable reading/writing caches even if cache paths are provided.",
+    )
     parser.set_defaults(**config_defaults)
     args = parser.parse_args(argv)
 
@@ -1050,6 +1161,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.data_root = str(resolve_path(args.data_root, allow_missing=True))
     args.log_dir = str(resolve_path(args.log_dir, allow_missing=True))
     args.samples_dir = str(resolve_path(args.samples_dir, allow_missing=True))
+    if args.cache_embedding_bank:
+        args.cache_embedding_bank = str(resolve_path(args.cache_embedding_bank, allow_missing=True))
+    if args.cache_index:
+        args.cache_index = str(resolve_path(args.cache_index, allow_missing=True))
     if args.legacy_root:
         # Resolve legacy roots but allow them to be missing on the current machine;
         # we only use them for prefix-stripping and remapping.
@@ -1102,20 +1217,73 @@ def train(args: argparse.Namespace) -> None:
             "Slide-level contrastive training now requires --reticulin-embedding-dir "
             "with precomputed reticulin embeddings."
         )
-    dataset = build_dataset(args)
-    LOGGER.info("Slides available: %d", len(dataset))
-    embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset)
-    LOGGER.info(
-        "Embedding bank covers %d slide(s); slides without embeddings will be skipped in contrastive loss.",
-        len(embedding_bank.slide_ids),
-    )
 
-    loaders = build_split_loaders(dataset, args)
-    train_loader = loaders["train"]
-    if train_loader is None:
-        raise RuntimeError("Training loader is empty after filtering; cannot proceed.")
-    val_loader = loaders.get("val")
-    test_loader = loaders.get("test")
+    metadata_dataset: SlidePatchDataset | None = None
+
+    def ensure_dataset() -> SlidePatchDataset:
+        nonlocal metadata_dataset
+        if metadata_dataset is None:
+            metadata_dataset = build_dataset(args)
+            LOGGER.info("Slides available before filtering: %d", len(metadata_dataset))
+        return metadata_dataset
+
+    embedding_bank = _load_cache(args.cache_embedding_bank, "embedding bank", args.no_cache)
+    if embedding_bank is None:
+        dataset_for_bank = ensure_dataset()
+        embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset_for_bank)
+        LOGGER.info(
+            "Embedding bank covers %d slide(s); slides without embeddings will be skipped in contrastive loss.",
+            len(embedding_bank.slide_ids),
+        )
+        _save_cache(embedding_bank, args.cache_embedding_bank, "embedding bank", args.no_cache)
+    else:
+        LOGGER.info(
+            "Loaded embedding bank cache covering %d slide(s).",
+            len(embedding_bank.slide_ids),
+        )
+
+    index_cache = _load_cache(args.cache_index, "augment index", args.no_cache)
+
+    def dataset_from_entries(entries: list[dict[str, Any]] | None) -> SlidePatchDataset | None:
+        if not entries:
+            return None
+        return SlidePatchDataset.from_serialized(entries, args)
+
+    if index_cache is not None:
+        LOGGER.info("Using cached dataset index.")
+        train_dataset = dataset_from_entries(index_cache.get("train"))
+        if train_dataset is None:
+            raise RuntimeError("Cached index missing training entries.")
+        val_dataset = dataset_from_entries(index_cache.get("val"))
+        test_dataset = dataset_from_entries(index_cache.get("test"))
+        train_loader = build_dataloader(train_dataset, args, shuffle=True)
+        val_loader = (
+            build_dataloader(val_dataset, args, shuffle=False) if val_dataset is not None else None
+        )
+        test_loader = (
+            build_dataloader(test_dataset, args, shuffle=False) if test_dataset is not None else None
+        )
+        dataset_for_preview: SlidePatchDataset = train_dataset
+    else:
+        dataset = ensure_dataset()
+        allowed_ids = set(embedding_bank.slide_ids)
+        removed = dataset.filter_slides(allowed_ids)
+        if removed:
+            LOGGER.info("Filtered %d slide(s) missing embeddings; %d remain.", removed, len(dataset))
+        loaders, split_indices = build_split_loaders(dataset, args, return_indices=True)
+        train_loader = loaders["train"]
+        if train_loader is None:
+            raise RuntimeError("Training loader is empty after filtering; cannot proceed.")
+        val_loader = loaders.get("val")
+        test_loader = loaders.get("test")
+        dataset_for_preview = dataset
+        if args.cache_index and not args.no_cache:
+            serialized = {
+                split: dataset.serialize_entries(indices) if indices else []
+                for split, indices in split_indices.items()
+            }
+            _save_cache(serialized, args.cache_index, "augment index", args.no_cache)
+
     LOGGER.info(
         "Loader sizes | train: %s | val: %s | test: %s",
         len(train_loader),
@@ -1132,7 +1300,7 @@ def train(args: argparse.Namespace) -> None:
     mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, -1, 1, 1)
     std = torch.tensor(IMAGENET_STD, device=device).view(1, -1, 1, 1)
 
-    sample_he, sample_ret, _, _ = dataset[0]
+    sample_he, sample_ret, _, _ = dataset_for_preview[0]
     feat_dim = infer_feature_dim(feature_extractor, sample_ret.unsqueeze(0).to(device), mean, std)
     LOGGER.info("Feature dimension inferred as %d", feat_dim)
 
@@ -1192,7 +1360,7 @@ def train(args: argparse.Namespace) -> None:
     preview_he: torch.Tensor | None = None
     preview_ret: torch.Tensor | None = None
     try:
-        he_stack, ret_stack, _, _ = dataset.get_slide(0, deterministic=True)
+        he_stack, ret_stack, _, _ = dataset_for_preview.get_slide(0, deterministic=True)  # type: ignore[attr-defined]
         # he_stack: [P, C, H, W] -> add a slide dimension -> [1, P, C, H, W]
         preview_he = he_stack.unsqueeze(0).to(device, non_blocking=True)
         preview_ret = ret_stack.unsqueeze(0).to(device, non_blocking=True)
