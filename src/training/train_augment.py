@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms as T
 from torchvision.utils import save_image
 from tqdm.auto import tqdm
+from distutils.util import strtobool
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_ROOT = SCRIPT_DIR.parent
@@ -45,8 +46,8 @@ GRADE_PATTERN = re.compile(r"(\d+)")
 
 
 try:  # pragma: no cover - prefer the v3 architecture used in main CycleGAN training
-    from models.Backbone_model.CycleGAN import UNetGenerator as CycleGenerator  # type: ignore
-    from models.Backbone_model.CycleGAN import Discriminator as CycleDiscriminator  # type: ignore
+    from models.Backbone_model.CycleGANv3 import UNetGenerator as CycleGenerator  # type: ignore
+    from models.Backbone_model.CycleGANv3 import Discriminator as CycleDiscriminator  # type: ignore
 except Exception:
     # Fallback to v2 if v3 is not available on this machine
     from models.Backbone_model.CycleGANv2 import UNetGenerator as CycleGenerator  # type: ignore
@@ -77,6 +78,12 @@ class SlideRecord:
 
 def _numeric_tokens(value: str) -> list[int]:
     return [int(match.group()) for match in re.finditer(r"\d+", value)]
+
+
+def _bool_arg(value: str | bool | int) -> bool:
+    if isinstance(value, bool):
+        return value
+    return bool(strtobool(str(value)))
 
 
 def _stain_prefix(value: str) -> str:
@@ -1112,6 +1119,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Disable reading/writing caches even if cache paths are provided.",
     )
+    parser.add_argument(
+        "--grad-req",
+        type=_bool_arg,
+        default=True,
+        help="Whether to enable gradient computation/backprop (set to false for inference-only runs).",
+    )
     parser.set_defaults(**config_defaults)
     args = parser.parse_args(argv)
 
@@ -1165,6 +1178,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.cache_embedding_bank = str(resolve_path(args.cache_embedding_bank, allow_missing=True))
     if args.cache_index:
         args.cache_index = str(resolve_path(args.cache_index, allow_missing=True))
+    args.grad_req = _bool_arg(args.grad_req)
     if args.legacy_root:
         # Resolve legacy roots but allow them to be missing on the current machine;
         # we only use them for prefix-stripping and remapping.
@@ -1345,8 +1359,11 @@ def train(args: argparse.Namespace) -> None:
     criterion_gan = nn.MSELoss()
     l1_loss = nn.L1Loss()
     criterion_cls = nn.CrossEntropyLoss()
-    use_amp = bool(args.amp and device.type == "cuda")
-    if args.amp and not use_amp:
+    grad_enabled = bool(args.grad_req)
+    if not grad_enabled:
+        LOGGER.warning("grad_req set to False – running in inference-only mode (no optimizer steps).")
+    use_amp = bool(args.amp and device.type == "cuda" and grad_enabled)
+    if args.amp and not use_amp and device.type != "cuda":
         LOGGER.warning("AMP requested but device %s does not support CUDA autocast.", device.type)
     LOGGER.info("AMP enabled: %s", use_amp)
     scaler_G = GradScaler(enabled=use_amp)
@@ -1445,36 +1462,45 @@ def train(args: argparse.Namespace) -> None:
             weighted_cls = args.lambda_cls * cls_loss
             weighted_con = args.lambda_con * contrastive_loss
 
-            grad_adv = component_grad_norm(weighted_adv, grad_modules)
-            grad_cycle = component_grad_norm(weighted_cycle, grad_modules)
-            grad_identity = component_grad_norm(weighted_identity, grad_modules)
-            grad_cls = component_grad_norm(weighted_cls, grad_modules)
-            grad_con = component_grad_norm(weighted_con, grad_modules)
+            if grad_enabled:
+                grad_adv = component_grad_norm(weighted_adv, grad_modules)
+                grad_cycle = component_grad_norm(weighted_cycle, grad_modules)
+                grad_identity = component_grad_norm(weighted_identity, grad_modules)
+                grad_cls = component_grad_norm(weighted_cls, grad_modules)
+                grad_con = component_grad_norm(weighted_con, grad_modules)
+            else:
+                grad_adv = grad_cycle = grad_identity = grad_cls = grad_con = 0.0
 
             loss_G = weighted_adv + weighted_cycle + weighted_identity + weighted_cls + weighted_con
 
-            opt_G.zero_grad(set_to_none=True)
-            if use_amp:
-                scaler_G.scale(loss_G).backward()
-                scaler_G.step(opt_G)
-                scaler_G.update()
+            if grad_enabled:
+                opt_G.zero_grad(set_to_none=True)
+                if use_amp:
+                    scaler_G.scale(loss_G).backward()
+                    scaler_G.step(opt_G)
+                    scaler_G.update()
+                else:
+                    loss_G.backward()
+                    opt_G.step()
             else:
-                loss_G.backward()
-                opt_G.step()
+                loss_G = loss_G.detach()
 
             with amp_context():
                 D_R_loss, _ = adversarial_loss(D_R, ret_flat, fake_ret_flat, criterion_gan)
                 D_H_loss, _ = adversarial_loss(D_H, he_flat, fake_he_flat, criterion_gan)
                 loss_D = D_R_loss + D_H_loss
 
-            opt_D.zero_grad(set_to_none=True)
-            if use_amp:
-                scaler_D.scale(loss_D).backward()
-                scaler_D.step(opt_D)
-                scaler_D.update()
+            if grad_enabled:
+                opt_D.zero_grad(set_to_none=True)
+                if use_amp:
+                    scaler_D.scale(loss_D).backward()
+                    scaler_D.step(opt_D)
+                    scaler_D.update()
+                else:
+                    loss_D.backward()
+                    opt_D.step()
             else:
-                loss_D.backward()
-                opt_D.step()
+                loss_D = loss_D.detach()
 
             LOGGER.info(
                 "[GRADS] adv=%.6e | cycle=%.6e | identity=%.6e | cls=%.6e | con=%.6e || "
@@ -1484,9 +1510,9 @@ def train(args: argparse.Namespace) -> None:
                 grad_identity,
                 grad_cls,
                 grad_con,
-                grad_norm(G_H2R),
-                grad_norm(G_R2H),
-                grad_norm(projector),
+                grad_norm(G_H2R) if grad_enabled else 0.0,
+                grad_norm(G_R2H) if grad_enabled else 0.0,
+                grad_norm(projector) if grad_enabled else 0.0,
             )
 
             if args.profile_steps and device.type == "cuda":

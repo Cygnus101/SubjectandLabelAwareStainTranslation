@@ -31,7 +31,7 @@ ensure_project_root_on_syspath()
 PROJECT_ROOT = get_project_root()
 
 try:  # pragma: no cover
-    from models.Backbone_model.CycleGAN import UNetGenerator as CycleGenerator  # type: ignore
+    from models.Backbone_model.CycleGANv3 import UNetGenerator as CycleGenerator  # type: ignore
 except Exception:  # pragma: no cover
     from models.Backbone_model.CycleGANv2 import UNetGenerator as CycleGenerator  # type: ignore
 
