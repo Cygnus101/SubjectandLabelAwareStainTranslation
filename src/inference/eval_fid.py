@@ -125,6 +125,15 @@ def _generate_reticulin_patches(
             src_path = _resolve_patch(row["patch_path"])
             with Image.open(src_path) as img:
                 img = img.convert("RGB")
+            # Enforce exact patch size; skip any mismatched tiles to avoid generator shape errors
+            if img.size != (patch_size, patch_size):
+                logging.warning(
+                    "Skipping H&E patch %s with size %s (expected %s)",
+                    row["patch_path"],
+                    img.size,
+                    (patch_size, patch_size),
+                )
+                continue
         except (FileNotFoundError, UnidentifiedImageError, OSError) as exc:
             logging.warning("Skipping H&E patch %s (%s)", row["patch_path"], type(exc).__name__)
             continue
