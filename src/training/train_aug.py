@@ -76,6 +76,18 @@ class SlideRecord:
         return f"{self.lab_id}|{self.he_stain_id}|{self.ret_stain_id}"
 
 
+@dataclass
+class AugmentedSlide:
+    lab_id: str
+    he_stain_id: str
+    ret_stain_id: str
+    grade: int
+    he_paths: list[Path]
+    he_top_flags: list[int]
+    ret_paths: list[Path]
+    ret_top_flags: list[int]
+
+
 def _numeric_tokens(value: str) -> list[int]:
     return [int(match.group()) for match in re.finditer(r"\d+", value)]
 
@@ -111,6 +123,83 @@ def _closest_stain_id(source: str, candidates: Sequence[str]) -> Optional[str]:
         return (prefix_penalty, diff, candidate)
 
     return min(candidates, key=score)
+
+
+def _resolve_patch_path(raw: str, data_root: Optional[Path]) -> Path:
+    path = Path(str(raw))
+    if path.is_absolute():
+        return path
+    base = Path(data_root) if data_root else PROJECT_ROOT
+    return (base / path).resolve()
+
+
+def load_augmented_slides(slides_path: Path, data_root: Optional[Path]) -> list[AugmentedSlide]:
+    payload = json.loads(Path(slides_path).read_text("utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Serialized slides file {slides_path} must contain a list.")
+    slides: list[AugmentedSlide] = []
+    for entry in payload:
+        try:
+            lab_id = str(entry["lab_id"])
+            he_id = str(entry["he_stain_id"])
+            ret_id = str(entry["ret_stain_id"])
+            grade = int(entry["grade"])
+            he_meta = entry.get("he_patches", [])
+            ret_meta = entry.get("ret_patches", [])
+        except KeyError as exc:
+            raise ValueError(f"Slide entry missing required field: {exc}") from exc
+        he_paths: list[Path] = []
+        he_flags: list[int] = []
+        for patch in he_meta:
+            he_paths.append(_resolve_patch_path(patch["patch_path"], data_root))
+            he_flags.append(int(patch.get("is_top10", 0)))
+        ret_paths: list[Path] = []
+        ret_flags: list[int] = []
+        for patch in ret_meta:
+            ret_paths.append(_resolve_patch_path(patch["patch_path"], data_root))
+            ret_flags.append(int(patch.get("is_top10", 0)))
+        if len(he_flags) < len(he_paths):
+            he_flags.extend([0] * (len(he_paths) - len(he_flags)))
+        if len(ret_flags) < len(ret_paths):
+            ret_flags.extend([0] * (len(ret_paths) - len(ret_flags)))
+        he_flags = he_flags[: len(he_paths)]
+        ret_flags = ret_flags[: len(ret_paths)]
+        if not he_paths or not ret_paths:
+            continue
+        slides.append(
+            AugmentedSlide(
+                lab_id=lab_id,
+                he_stain_id=he_id,
+                ret_stain_id=ret_id,
+                grade=grade,
+                he_paths=he_paths,
+                he_top_flags=he_flags,
+                ret_paths=ret_paths,
+                ret_top_flags=ret_flags,
+            )
+        )
+    if not slides:
+        raise RuntimeError(f"No slides loaded from {slides_path}")
+    LOGGER.info("Loaded %d serialized slide(s) from %s", len(slides), slides_path)
+    return slides
+
+
+def load_augmented_splits(split_path: Path) -> dict[str, list[int]]:
+    payload = json.loads(Path(split_path).read_text("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Split file {split_path} must contain a mapping.")
+
+    def _extract(key: str) -> list[int]:
+        values = payload.get(key, [])
+        if values is None:
+            return []
+        return [int(v) for v in values]
+
+    return {
+        "train": _extract("train_indices"),
+        "val": _extract("val_indices"),
+        "test": _extract("test_indices"),
+    }
 
 
 def _parse_grade(value: object) -> Optional[int]:
@@ -399,6 +488,275 @@ class SlidePatchDataset(Dataset):
             legacy_roots=legacy_roots,
             entries=records,
         )
+
+
+class AugmentedSlideDataset(Dataset):
+    def __init__(
+        self,
+        slides: list[AugmentedSlide],
+        patches_per_slide: int,
+        image_size: int,
+        augment: bool,
+        seed: int,
+        patch_retries: int = 8,
+        top_fraction: float = 0.25,
+    ) -> None:
+        if not slides:
+            raise ValueError("AugmentedSlideDataset received an empty slide list.")
+        self.entries = slides
+        self.seed = seed
+        self.patches_per_slide = patches_per_slide
+        self.patch_retries = max(1, patch_retries)
+        self.top_fraction = max(0.0, min(1.0, float(top_fraction)))
+        self.train_transform = _build_patch_transform(image_size, augment)
+        self.eval_transform = _build_patch_transform(image_size, augment=False)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def _sample_indices(
+        self, total: int, flags: Sequence[int], deterministic: bool
+    ) -> list[int]:
+        if total <= 0:
+            raise RuntimeError("Slide contains no patches.")
+        if deterministic:
+            indices = list(range(min(total, self.patches_per_slide)))
+            while len(indices) < self.patches_per_slide:
+                indices.append(indices[-1] if indices else 0)
+            return indices[: self.patches_per_slide]
+
+        top_indices = [i for i, flag in enumerate(flags) if flag]
+        all_indices = list(range(total))
+        k_top = int(round(self.patches_per_slide * self.top_fraction))
+        if self.top_fraction > 0.0:
+            k_top = max(1, k_top)
+        else:
+            k_top = 0
+        k_top = min(k_top, self.patches_per_slide)
+        k_rest = self.patches_per_slide - k_top
+
+        def _draw(pool: list[int], count: int) -> list[int]:
+            if count <= 0:
+                return []
+            if not pool:
+                pool = all_indices
+            idx = torch.randint(
+                0, len(pool), (count,), dtype=torch.long
+            ).tolist()
+            return [pool[i] for i in idx]
+
+        selected = _draw(top_indices or all_indices, k_top)
+        selected += _draw(all_indices, k_rest)
+        return selected
+
+    def _load_stack(
+        self,
+        paths: Sequence[Path],
+        indices: list[int],
+        transform: T.Compose,
+        allow_repeat: bool,
+    ) -> torch.Tensor:
+        images: list[torch.Tensor] = []
+        attempts = 0
+        max_attempts = self.patch_retries * max(1, len(indices))
+        total = len(paths)
+        if total == 0:
+            raise RuntimeError("Slide has no patch paths.")
+        pointer = 0
+        while len(images) < len(indices) and attempts < max_attempts:
+            idx = indices[pointer]
+            pointer = (pointer + 1) % len(indices)
+            path = paths[idx % total]
+            try:
+                with Image.open(path) as img:
+                    tensor = transform(img.convert("RGB"))
+            except (FileNotFoundError, UnidentifiedImageError, OSError) as exc:
+                LOGGER.warning("Failed to load patch %s (%s)", path, exc)
+                if allow_repeat:
+                    indices[pointer - 1] = torch.randint(0, total, (1,), dtype=torch.long).item()
+                attempts += 1
+                continue
+            images.append(tensor)
+        if len(images) < len(indices):
+            raise RuntimeError("Unable to collect enough patches for a slide.")
+        return torch.stack(images, dim=0)
+
+    def get_slide(
+        self,
+        idx: int,
+        *,
+        deterministic: bool = False,
+    ):
+        record = self.entries[idx]
+        he_indices = self._sample_indices(
+            len(record.he_paths), record.he_top_flags, deterministic
+        )
+        ret_indices = self._sample_indices(
+            len(record.ret_paths), record.ret_top_flags, deterministic
+        )
+        transform = self.eval_transform if deterministic else self.train_transform
+        he_stack = self._load_stack(
+            record.he_paths, he_indices, transform, allow_repeat=not deterministic
+        )
+        ret_stack = self._load_stack(
+            record.ret_paths, ret_indices, transform, allow_repeat=not deterministic
+        )
+        grade = torch.tensor(record.grade, dtype=torch.long)
+        return he_stack, ret_stack, grade, record.ret_stain_id
+
+    def __getitem__(self, idx: int):
+        return self.get_slide(idx)
+
+
+@dataclass
+class SlideChunkSchedule:
+    he_chunks: list[list[int]]
+    ret_chunks: list[list[int]]
+
+    @property
+    def num_chunks(self) -> int:
+        return len(self.he_chunks)
+
+
+def _compute_top_quota(patches_per_slide: int, top_fraction: float) -> int:
+    if top_fraction <= 0.0:
+        return 0
+    quota = int(round(patches_per_slide * top_fraction))
+    return max(1, min(patches_per_slide, quota))
+
+
+def _build_chunks_for_stain(
+    flags: Sequence[int],
+    total_patches: int,
+    patches_per_slide: int,
+    top_fraction: float,
+    rng: random.Random,
+) -> list[list[int]]:
+    top_pool = [i for i, flag in enumerate(flags[:total_patches]) if flag]
+    other_pool = [i for i, flag in enumerate(flags[:total_patches]) if not flag]
+    rng.shuffle(top_pool)
+    rng.shuffle(other_pool)
+    if not top_pool and not other_pool and total_patches > 0:
+        other_pool = list(range(total_patches))
+    chunks: list[list[int]] = []
+    top_quota = _compute_top_quota(patches_per_slide, top_fraction) if top_pool else 0
+    while top_pool or other_pool:
+        chunk: list[int] = []
+        remaining = patches_per_slide
+        take_top = min(len(top_pool), top_quota)
+        if take_top == 0 and top_pool and not other_pool:
+            take_top = min(len(top_pool), remaining)
+        take_top = min(take_top, remaining)
+        if take_top > 0:
+            chunk.extend(top_pool[:take_top])
+            del top_pool[:take_top]
+            remaining -= take_top
+        if remaining > 0:
+            take_other = min(len(other_pool), remaining)
+            if take_other > 0:
+                chunk.extend(other_pool[:take_other])
+                del other_pool[:take_other]
+                remaining -= take_other
+        if remaining > 0:
+            fallback = top_pool if top_pool else other_pool
+            if fallback:
+                take_more = min(len(fallback), remaining)
+                chunk.extend(fallback[:take_more])
+                del fallback[:take_more]
+                remaining -= take_more
+        if not chunk:
+            break
+        chunks.append(chunk)
+    if not chunks and total_patches > 0:
+        chunks.append(list(range(min(total_patches, patches_per_slide))))
+    return chunks
+
+
+def _pad_chunks(chunks: list[list[int]], target: int) -> list[list[int]]:
+    if not chunks:
+        return []
+    padded = [chunk[:] for chunk in chunks]
+    while len(padded) < target:
+        padded.append(padded[-1][:])
+    return padded[:target]
+
+
+def _build_slide_schedule(
+    slide: AugmentedSlide,
+    patches_per_slide: int,
+    top_fraction: float,
+    rng: random.Random,
+) -> SlideChunkSchedule:
+    he_chunks = _build_chunks_for_stain(
+        slide.he_top_flags,
+        len(slide.he_paths),
+        patches_per_slide,
+        top_fraction,
+        rng,
+    )
+    ret_chunks = _build_chunks_for_stain(
+        slide.ret_top_flags,
+        len(slide.ret_paths),
+        patches_per_slide,
+        top_fraction,
+        rng,
+    )
+    target = max(len(he_chunks), len(ret_chunks))
+    he_chunks = _pad_chunks(he_chunks, target)
+    ret_chunks = _pad_chunks(ret_chunks, target)
+    return SlideChunkSchedule(he_chunks=he_chunks, ret_chunks=ret_chunks)
+
+
+def _build_epoch_schedule(
+    slides: Sequence[AugmentedSlide],
+    slide_indices: Sequence[int],
+    patches_per_slide: int,
+    top_fraction: float,
+    rng: random.Random,
+) -> dict[int, SlideChunkSchedule]:
+    schedule: dict[int, SlideChunkSchedule] = {}
+    for idx in slide_indices:
+        if idx < 0 or idx >= len(slides):
+            continue
+        slide = slides[idx]
+        schedule[idx] = _build_slide_schedule(slide, patches_per_slide, top_fraction, rng)
+    return schedule
+
+
+def _chunk_indices_for_stack(
+    chunk: list[int],
+    total_patches: int,
+    target_count: int,
+) -> list[int]:
+    indices = list(chunk[:target_count])
+    if not indices:
+        indices = list(range(min(total_patches, target_count)))
+    if not indices:
+        raise RuntimeError("Slide contains no available patches.")
+    base = indices[:]
+    ptr = 0
+    while len(indices) < target_count:
+        indices.append(base[ptr % len(base)])
+        ptr += 1
+    return indices[:target_count]
+
+
+def _load_chunk_stack(
+    dataset: AugmentedSlideDataset,
+    paths: Sequence[Path],
+    chunk_indices: list[int],
+    deterministic: bool,
+) -> torch.Tensor:
+    target = dataset.patches_per_slide
+    indices = _chunk_indices_for_stack(chunk_indices, len(paths), target)
+    transform = dataset.eval_transform if deterministic else dataset.train_transform
+    return dataset._load_stack(paths, indices, transform, allow_repeat=not deterministic)
+
+
+def _batch_slide_indices(indices: Sequence[int], batch_size: int) -> list[list[int]]:
+    if batch_size <= 0:
+        raise ValueError("batch_slides must be positive.")
+    return [list(indices[i : i + batch_size]) for i in range(0, len(indices), batch_size)]
 
 
 class SlideEmbeddingBank:
@@ -957,12 +1315,51 @@ def infer_feature_dim(encoder: nn.Module, sample: torch.Tensor, mean: torch.Tens
     return feats.shape[1]
 
 
-def save_checkpoints(run_dir: Path, epoch: int, modules: dict[str, nn.Module]) -> None:
+def save_checkpoints(
+    run_dir: Path,
+    epoch: int,
+    modules: dict[str, nn.Module],
+    optimizers: dict[str, torch.optim.Optimizer | None],
+    scalers: dict[str, GradScaler | None],
+) -> None:
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {"epoch": epoch}
     for name, module in modules.items():
-        path = ckpt_dir / f"{name}_epoch{epoch}.pt"
-        torch.save({"state_dict": module.state_dict()}, path)
+        payload[name] = module.state_dict()
+    for name, opt in optimizers.items():
+        if opt is not None:
+            payload[name] = opt.state_dict()
+    for name, scaler in scalers.items():
+        if scaler is not None:
+            payload[name] = scaler.state_dict()
+    path = ckpt_dir / f"train_state_epoch{epoch}.pt"
+    torch.save(payload, path)
+
+
+def load_checkpoints(
+    run_dir: Path,
+    epoch: int,
+    modules: dict[str, nn.Module],
+    optimizers: dict[str, torch.optim.Optimizer | None],
+    scalers: dict[str, GradScaler | None],
+) -> None:
+    ckpt_dir = Path(run_dir) / "checkpoints"
+    path = ckpt_dir / f"train_state_epoch{epoch}.pt"
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint {path} not found.")
+    state = torch.load(path, map_location="cpu")
+    for name, module in modules.items():
+        payload = state.get(name)
+        if payload is None:
+            raise KeyError(f"Checkpoint missing state for module {name}.")
+        module.load_state_dict(payload)
+    for name, opt in optimizers.items():
+        if opt is not None and name in state:
+            opt.load_state_dict(state[name])
+    for name, scaler in scalers.items():
+        if scaler is not None and name in state:
+            scaler.load_state_dict(state[name])
 
 
 def _load_cli_defaults(config_path: Optional[str]) -> dict[str, Any]:
@@ -1005,6 +1402,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--metadata", type=str, default=str(PROJECT_ROOT / "metadata.csv"))
     parser.add_argument("--data-root", type=str, default=None)
+    parser.add_argument(
+        "--augmented-slides",
+        type=str,
+        required=True,
+        help="Path to augmented_slides.json produced by build_augmented_dataset.py",
+    )
+    parser.add_argument(
+        "--augmented-splits",
+        type=str,
+        required=True,
+        help="Path to augmented_splits.json produced by build_augmented_dataset.py",
+    )
     parser.add_argument("--batch-slides", type=int, default=2)
     parser.add_argument("--patches-per-slide", type=int, default=32)
     parser.add_argument("--lambda-cycle", type=float, default=50.0)
@@ -1125,6 +1534,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Whether to enable gradient computation/backprop (set to false for inference-only runs).",
     )
+    parser.add_argument(
+        "--top-fraction",
+        type=float,
+        default=0.25,
+        help="Fraction of patches drawn from the top attention pool (default 0.25).",
+    )
+    parser.add_argument(
+        "--resume-dir",
+        type=str,
+        default=None,
+        help="Optional run directory to resume from (expects checkpoints there).",
+    )
+    parser.add_argument(
+        "--resume-epoch",
+        type=int,
+        default=None,
+        help="Epoch number to resume from (requires --resume-dir).",
+    )
     parser.set_defaults(**config_defaults)
     args = parser.parse_args(argv)
 
@@ -1152,6 +1579,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise ValueError("--val-ratio and --test-ratio must be within [0, 1).")
     if args.val_ratio + args.test_ratio >= 0.95:
         raise ValueError("val_ratio + test_ratio must be less than 0.95 to leave room for training.")
+    if not (0.0 <= args.top_fraction <= 1.0):
+        raise ValueError("--top-fraction must be within [0, 1].")
+    if (args.resume_dir and args.resume_epoch is None) or (args.resume_epoch and not args.resume_dir):
+        raise ValueError("--resume-dir and --resume-epoch must be provided together.")
     required = [
         "pretrained_cyclegan",
         "pretrained_encoder",
@@ -1172,6 +1603,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.metadata = str(resolve_path(args.metadata))
     if args.data_root:
         args.data_root = str(resolve_path(args.data_root, allow_missing=True))
+    args.augmented_slides = str(resolve_path(args.augmented_slides))
+    args.augmented_splits = str(resolve_path(args.augmented_splits))
     args.log_dir = str(resolve_path(args.log_dir, allow_missing=True))
     args.samples_dir = str(resolve_path(args.samples_dir, allow_missing=True))
     if args.cache_embedding_bank:
@@ -1179,6 +1612,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.cache_index:
         args.cache_index = str(resolve_path(args.cache_index, allow_missing=True))
     args.grad_req = _bool_arg(args.grad_req)
+    if args.resume_dir:
+        args.resume_dir = str(resolve_path(args.resume_dir, allow_missing=True))
     if args.legacy_root:
         # Resolve legacy roots but allow them to be missing on the current machine;
         # we only use them for prefix-stripping and remapping.
@@ -1231,20 +1666,40 @@ def train(args: argparse.Namespace) -> None:
             "Slide-level contrastive training now requires --reticulin-embedding-dir "
             "with precomputed reticulin embeddings."
         )
+    slides = load_augmented_slides(
+        Path(args.augmented_slides),
+        Path(args.data_root) if args.data_root else None,
+    )
+    dataset = AugmentedSlideDataset(
+        slides=slides,
+        patches_per_slide=args.patches_per_slide,
+        image_size=args.image_size,
+        augment=not args.no_augment,
+        seed=args.seed,
+        patch_retries=args.patch_retries,
+        top_fraction=args.top_fraction,
+    )
+    splits = load_augmented_splits(Path(args.augmented_splits))
 
-    metadata_dataset: SlidePatchDataset | None = None
+    def _build_subset(indices: list[int]) -> Subset | None:
+        valid = [idx for idx in indices if 0 <= idx < len(dataset)]
+        if not valid:
+            return None
+        return Subset(dataset, valid)
 
-    def ensure_dataset() -> SlidePatchDataset:
-        nonlocal metadata_dataset
-        if metadata_dataset is None:
-            metadata_dataset = build_dataset(args)
-            LOGGER.info("Slides available before filtering: %d", len(metadata_dataset))
-        return metadata_dataset
+    train_slide_indices = [idx for idx in splits["train"] if 0 <= idx < len(slides)]
+    if not train_slide_indices:
+        raise RuntimeError("Training indices list is empty; cannot start training.")
+    val_subset = _build_subset(splits["val"])
+    test_subset = _build_subset(splits["test"])
+
+    val_loader = build_dataloader(val_subset, args, shuffle=False) if val_subset else None
+    test_loader = build_dataloader(test_subset, args, shuffle=False) if test_subset else None
+    dataset_for_preview = dataset
 
     embedding_bank = _load_cache(args.cache_embedding_bank, "embedding bank", args.no_cache)
     if embedding_bank is None:
-        dataset_for_bank = ensure_dataset()
-        embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset_for_bank)
+        embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset)
         LOGGER.info(
             "Embedding bank covers %d slide(s); slides without embeddings will be skipped in contrastive loss.",
             len(embedding_bank.slide_ids),
@@ -1256,51 +1711,14 @@ def train(args: argparse.Namespace) -> None:
             len(embedding_bank.slide_ids),
         )
 
-    index_cache = _load_cache(args.cache_index, "augment index", args.no_cache)
-
-    def dataset_from_entries(entries: list[dict[str, Any]] | None) -> SlidePatchDataset | None:
-        if not entries:
-            return None
-        return SlidePatchDataset.from_serialized(entries, args)
-
-    if index_cache is not None:
-        LOGGER.info("Using cached dataset index.")
-        train_dataset = dataset_from_entries(index_cache.get("train"))
-        if train_dataset is None:
-            raise RuntimeError("Cached index missing training entries.")
-        val_dataset = dataset_from_entries(index_cache.get("val"))
-        test_dataset = dataset_from_entries(index_cache.get("test"))
-        train_loader = build_dataloader(train_dataset, args, shuffle=True)
-        val_loader = (
-            build_dataloader(val_dataset, args, shuffle=False) if val_dataset is not None else None
-        )
-        test_loader = (
-            build_dataloader(test_dataset, args, shuffle=False) if test_dataset is not None else None
-        )
-        dataset_for_preview: SlidePatchDataset = train_dataset
-    else:
-        dataset = ensure_dataset()
-        allowed_ids = set(embedding_bank.slide_ids)
-        removed = dataset.filter_slides(allowed_ids)
-        if removed:
-            LOGGER.info("Filtered %d slide(s) missing embeddings; %d remain.", removed, len(dataset))
-        loaders, split_indices = build_split_loaders(dataset, args, return_indices=True)
-        train_loader = loaders["train"]
-        if train_loader is None:
-            raise RuntimeError("Training loader is empty after filtering; cannot proceed.")
-        val_loader = loaders.get("val")
-        test_loader = loaders.get("test")
-        dataset_for_preview = dataset
-        if args.cache_index and not args.no_cache:
-            serialized = {
-                split: dataset.serialize_entries(indices) if indices else []
-                for split, indices in split_indices.items()
-            }
-            _save_cache(serialized, args.cache_index, "augment index", args.no_cache)
-
     LOGGER.info(
-        "Loader sizes | train: %s | val: %s | test: %s",
-        len(train_loader),
+        "Slide counts | train=%d | val=%d | test=%d",
+        len(train_slide_indices),
+        len(splits["val"]),
+        len(splits["test"]),
+    )
+    LOGGER.info(
+        "Evaluation loader sizes | val: %s | test: %s",
         len(val_loader) if val_loader is not None else 0,
         len(test_loader) if test_loader is not None else 0,
     )
@@ -1370,22 +1788,62 @@ def train(args: argparse.Namespace) -> None:
     scaler_D = GradScaler(enabled=use_amp)
     amp_context = autocast if use_amp else nullcontext
     grad_modules = (G_H2R, G_R2H, projector)
+    module_states = {
+        "G_H2R": G_H2R,
+        "G_R2H": G_R2H,
+        "Proj": projector,
+        "D_R": D_R,
+        "D_H": D_H,
+    }
+    optimizer_states = {"opt_G": opt_G if grad_enabled else None, "opt_D": opt_D if grad_enabled else None}
+    scaler_states = {
+        "scaler_G": scaler_G if use_amp else None,
+        "scaler_D": scaler_D if use_amp else None,
+    }
+
+    start_epoch = 1
+    if args.resume_dir:
+        load_checkpoints(
+            Path(args.resume_dir),
+            int(args.resume_epoch),
+            module_states,
+            optimizer_states,
+            scaler_states,
+        )
+        start_epoch = int(args.resume_epoch) + 1
+        LOGGER.info("Resuming training from epoch %d (next epoch %d).", args.resume_epoch, start_epoch)
+    if start_epoch > args.epochs:
+        LOGGER.info(
+            "Start epoch (%d) exceeds configured epochs (%d); no training to run.",
+            start_epoch,
+            args.epochs,
+        )
+        return
 
     samples_dir.mkdir(parents=True, exist_ok=True)
 
+    history_path = run_dir / "history.json"
     history: list[dict[str, float]] = []
+    if args.resume_dir and Path(args.resume_dir) == run_dir and history_path.exists():
+        try:
+            history = json.loads(history_path.read_text("utf-8"))
+        except Exception as exc:
+            LOGGER.warning("Failed to load existing history from %s (%s).", history_path, exc)
+            history = []
     preview_he: torch.Tensor | None = None
     preview_ret: torch.Tensor | None = None
+    preview_index = train_slide_indices[0] if train_slide_indices else 0
     try:
-        he_stack, ret_stack, _, _ = dataset_for_preview.get_slide(0, deterministic=True)  # type: ignore[attr-defined]
+        he_stack, ret_stack, _, _ = dataset_for_preview.get_slide(preview_index, deterministic=True)
         # he_stack: [P, C, H, W] -> add a slide dimension -> [1, P, C, H, W]
         preview_he = he_stack.unsqueeze(0).to(device, non_blocking=True)
         preview_ret = ret_stack.unsqueeze(0).to(device, non_blocking=True)
     except Exception as exc:
         LOGGER.warning("Unable to collect preview samples (%s); skipping sample grids.", exc)
 
+    base_train_indices = list(train_slide_indices)
     step_idx = 0
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         G_H2R.train()
         G_R2H.train()
         D_R.train()
@@ -1400,144 +1858,211 @@ def train(args: argparse.Namespace) -> None:
             "identity": 0.0,
             "adv": 0.0,
         }
+        epoch_seed = args.seed + epoch
+        order_rng = random.Random(epoch_seed)
+        chunk_rng = random.Random(epoch_seed * 9973 + 17)
+        epoch_indices = base_train_indices[:]
+        order_rng.shuffle(epoch_indices)
+        epoch_schedule = _build_epoch_schedule(
+            slides,
+            epoch_indices,
+            args.patches_per_slide,
+            args.top_fraction,
+            chunk_rng,
+        )
+        slide_batches = _batch_slide_indices(epoch_indices, args.batch_slides)
+        total_steps = 0
+        for batch_indices in slide_batches:
+            valid_batch = [
+                idx for idx in batch_indices if idx in epoch_schedule and epoch_schedule[idx].num_chunks > 0
+            ]
+            if not valid_batch:
+                continue
+            total_steps += max(epoch_schedule[idx].num_chunks for idx in valid_batch)
+        progress = tqdm(total=total_steps, desc=f"Epoch {epoch}") if total_steps else None
         batches = 0
-        for he_batch, ret_batch, grades, slide_ids in tqdm(train_loader, desc=f"Epoch {epoch}"):
-            step_idx += 1
-            if args.profile_steps and device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats(device)
-                mem_start = torch.cuda.memory_allocated(device)
-                t_start = time.perf_counter()
-            batches += 1
-            he_batch = he_batch.to(device, non_blocking=True)
-            ret_batch = ret_batch.to(device, non_blocking=True)
-            grades = grades.to(device, non_blocking=True)
 
-            he_flat = he_batch.view(-1, *he_batch.shape[2:])
-            ret_flat = ret_batch.view(-1, *ret_batch.shape[2:])
+        for batch_indices in slide_batches:
+            valid_batch = [
+                idx for idx in batch_indices if idx in epoch_schedule and epoch_schedule[idx].num_chunks > 0
+            ]
+            if not valid_batch:
+                continue
+            T_batch = max(epoch_schedule[idx].num_chunks for idx in valid_batch)
+            for chunk_idx in range(T_batch):
+                step_idx += 1
+                if args.profile_steps and device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
+                    mem_start = torch.cuda.memory_allocated(device)
+                    t_start = time.perf_counter()
+                he_slide_stacks = []
+                ret_slide_stacks = []
+                grades = []
+                slide_ids = []
+                for slide_idx in valid_batch:
+                    schedule_entry = epoch_schedule[slide_idx]
+                    chunk_pos = min(chunk_idx, schedule_entry.num_chunks - 1)
+                    slide = slides[slide_idx]
+                    he_chunk = schedule_entry.he_chunks[chunk_pos]
+                    ret_chunk = schedule_entry.ret_chunks[chunk_pos]
+                    he_stack = _load_chunk_stack(
+                        dataset,
+                        slide.he_paths,
+                        he_chunk,
+                        deterministic=False,
+                    )
+                    ret_stack = _load_chunk_stack(
+                        dataset,
+                        slide.ret_paths,
+                        ret_chunk,
+                        deterministic=False,
+                    )
+                    he_slide_stacks.append(he_stack)
+                    ret_slide_stacks.append(ret_stack)
+                    grades.append(slide.grade)
+                    slide_ids.append(slide.ret_stain_id)
+                if not he_slide_stacks or not ret_slide_stacks:
+                    continue
+                batches += 1
+                he_batch = torch.stack(he_slide_stacks, dim=0).to(device, non_blocking=True)
+                ret_batch = torch.stack(ret_slide_stacks, dim=0).to(device, non_blocking=True)
+                grades_tensor = torch.tensor(grades, dtype=torch.long, device=device)
 
-            with amp_context():
-                fake_ret_flat = G_H2R(he_flat)
-                fake_he_flat = G_R2H(ret_flat)
-                fake_ret = fake_ret_flat.view_as(ret_batch)
-                fake_he = fake_he_flat.view_as(he_batch)
+                he_flat = he_batch.view(-1, *he_batch.shape[2:])
+                ret_flat = ret_batch.view(-1, *ret_batch.shape[2:])
 
-                rec_he = G_R2H(fake_ret_flat).view_as(he_batch)
-                rec_ret = G_H2R(fake_he_flat).view_as(ret_batch)
+                with amp_context():
+                    fake_ret_flat = G_H2R(he_flat)
+                    fake_he_flat = G_R2H(ret_flat)
+                    fake_ret = fake_ret_flat.view_as(ret_batch)
+                    fake_he = fake_he_flat.view_as(he_batch)
 
-                id_ret = G_H2R(ret_flat).view_as(ret_batch)
-                id_he = G_R2H(he_flat).view_as(he_batch)
+                    rec_he = G_R2H(fake_ret_flat).view_as(he_batch)
+                    rec_ret = G_H2R(fake_he_flat).view_as(ret_batch)
 
-                pred_fake_ret = D_R(fake_ret_flat)
-                pred_fake_he = D_H(fake_he_flat)
-                adv_loss = criterion_gan(pred_fake_ret, torch.ones_like(pred_fake_ret)) + criterion_gan(
-                    pred_fake_he, torch.ones_like(pred_fake_he)
-                )
-
-                cycle_loss = l1_loss(rec_he, he_batch) + l1_loss(rec_ret, ret_batch)
-
-                if args.lambda_identity > 0:
                     id_ret = G_H2R(ret_flat).view_as(ret_batch)
-                    id_he  = G_R2H(he_flat).view_as(he_batch)
-                    id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
-                else:
-                    id_loss = torch.zeros((), device=device)
-                # id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
+                    id_he = G_R2H(he_flat).view_as(he_batch)
 
-            z_fake = extract_patch_features(feature_extractor, fake_ret, mean, std, require_grad=True)
-            cls_loss, _ = compute_classification_loss(z_fake, grades, abmil, slide_classifier, criterion_cls)
-            contrastive_loss = compute_contrastive_loss_with_bank(
-                z_fake,
-                slide_ids,
-                embedding_bank,
-                projector,
-                args.contrastive_negatives,
-                args.temperature,
-            )
+                    pred_fake_ret = D_R(fake_ret_flat)
+                    pred_fake_he = D_H(fake_he_flat)
+                    adv_loss = criterion_gan(pred_fake_ret, torch.ones_like(pred_fake_ret)) + criterion_gan(
+                        pred_fake_he, torch.ones_like(pred_fake_he)
+                    )
 
-            id_weight = 0.0 if args.disable_identity_loss else args.lambda_identity
+                    cycle_loss = l1_loss(rec_he, he_batch) + l1_loss(rec_ret, ret_batch)
 
-            weighted_adv = adv_loss
-            weighted_cycle = args.lambda_cycle * cycle_loss
-            weighted_identity = id_weight * id_loss
-            weighted_cls = args.lambda_cls * cls_loss
-            weighted_con = args.lambda_con * contrastive_loss
+                    if args.lambda_identity > 0:
+                        id_ret = G_H2R(ret_flat).view_as(ret_batch)
+                        id_he = G_R2H(he_flat).view_as(he_batch)
+                        id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
+                    else:
+                        id_loss = torch.zeros((), device=device)
 
-            if grad_enabled:
-                grad_adv = component_grad_norm(weighted_adv, grad_modules)
-                grad_cycle = component_grad_norm(weighted_cycle, grad_modules)
-                grad_identity = component_grad_norm(weighted_identity, grad_modules)
-                grad_cls = component_grad_norm(weighted_cls, grad_modules)
-                grad_con = component_grad_norm(weighted_con, grad_modules)
-            else:
-                grad_adv = grad_cycle = grad_identity = grad_cls = grad_con = 0.0
-
-            loss_G = weighted_adv + weighted_cycle + weighted_identity + weighted_cls + weighted_con
-
-            if grad_enabled:
-                opt_G.zero_grad(set_to_none=True)
-                if use_amp:
-                    scaler_G.scale(loss_G).backward()
-                    scaler_G.step(opt_G)
-                    scaler_G.update()
-                else:
-                    loss_G.backward()
-                    opt_G.step()
-            else:
-                loss_G = loss_G.detach()
-
-            with amp_context():
-                D_R_loss, _ = adversarial_loss(D_R, ret_flat, fake_ret_flat, criterion_gan)
-                D_H_loss, _ = adversarial_loss(D_H, he_flat, fake_he_flat, criterion_gan)
-                loss_D = D_R_loss + D_H_loss
-
-            if grad_enabled:
-                opt_D.zero_grad(set_to_none=True)
-                if use_amp:
-                    scaler_D.scale(loss_D).backward()
-                    scaler_D.step(opt_D)
-                    scaler_D.update()
-                else:
-                    loss_D.backward()
-                    opt_D.step()
-            else:
-                loss_D = loss_D.detach()
-
-            LOGGER.info(
-                "[GRADS] adv=%.6e | cycle=%.6e | identity=%.6e | cls=%.6e | con=%.6e || "
-                "G_H2R=%.6e | G_R2H=%.6e | Proj=%.6e",
-                grad_adv,
-                grad_cycle,
-                grad_identity,
-                grad_cls,
-                grad_con,
-                grad_norm(G_H2R) if grad_enabled else 0.0,
-                grad_norm(G_R2H) if grad_enabled else 0.0,
-                grad_norm(projector) if grad_enabled else 0.0,
-            )
-
-            if args.profile_steps and device.type == "cuda":
-                # Ensure all queued CUDA work is finished before measuring
-                torch.cuda.synchronize(device)
-                t_end = time.perf_counter()
-                mem_end = torch.cuda.memory_allocated(device)
-                mem_peak = torch.cuda.max_memory_allocated(device)
-                LOGGER.info(
-                    "Profile | epoch=%d step=%d | time=%.3fs | mem_start=%.1f MB | mem_end=%.1f MB | mem_peak=%.1f MB",
-                    epoch,
-                    step_idx,
-                    t_end - t_start,
-                    mem_start / (1024**2),
-                    mem_end / (1024**2),
-                    mem_peak / (1024**2),
+                z_fake = extract_patch_features(feature_extractor, fake_ret, mean, std, require_grad=True)
+                cls_loss, _ = compute_classification_loss(z_fake, grades_tensor, abmil, slide_classifier, criterion_cls)
+                contrastive_loss = compute_contrastive_loss_with_bank(
+                    z_fake,
+                    slide_ids,
+                    embedding_bank,
+                    projector,
+                    args.contrastive_negatives,
+                    args.temperature,
                 )
 
-            epoch_metrics["G"] += loss_G.item()
-            epoch_metrics["D"] += loss_D.item()
-            epoch_metrics["cls"] += cls_loss.item()
-            epoch_metrics["con"] += contrastive_loss.item()
-            epoch_metrics["cycle"] += cycle_loss.item()
-            epoch_metrics["identity"] += id_loss.item()
-            epoch_metrics["adv"] += adv_loss.item()
+                id_weight = 0.0 if args.disable_identity_loss else args.lambda_identity
+
+                weighted_adv = adv_loss
+                weighted_cycle = args.lambda_cycle * cycle_loss
+                weighted_identity = id_weight * id_loss
+                weighted_cls = args.lambda_cls * cls_loss
+                weighted_con = args.lambda_con * contrastive_loss
+
+                if grad_enabled:
+                    grad_adv = component_grad_norm(weighted_adv, grad_modules)
+                    grad_cycle = component_grad_norm(weighted_cycle, grad_modules)
+                    grad_identity = component_grad_norm(weighted_identity, grad_modules)
+                    grad_cls = component_grad_norm(weighted_cls, grad_modules)
+                    grad_con = component_grad_norm(weighted_con, grad_modules)
+                else:
+                    grad_adv = grad_cycle = grad_identity = grad_cls = grad_con = 0.0
+
+                loss_G = weighted_adv + weighted_cycle + weighted_identity + weighted_cls + weighted_con
+
+                if grad_enabled:
+                    opt_G.zero_grad(set_to_none=True)
+                    if use_amp:
+                        scaler_G.scale(loss_G).backward()
+                        scaler_G.step(opt_G)
+                        scaler_G.update()
+                    else:
+                        loss_G.backward()
+                        opt_G.step()
+                else:
+                    loss_G = loss_G.detach()
+
+                with amp_context():
+                    D_R_loss, _ = adversarial_loss(D_R, ret_flat, fake_ret_flat, criterion_gan)
+                    D_H_loss, _ = adversarial_loss(D_H, he_flat, fake_he_flat, criterion_gan)
+                    loss_D = D_R_loss + D_H_loss
+
+                if grad_enabled:
+                    opt_D.zero_grad(set_to_none=True)
+                    if use_amp:
+                        scaler_D.scale(loss_D).backward()
+                        scaler_D.step(opt_D)
+                        scaler_D.update()
+                    else:
+                        loss_D.backward()
+                        opt_D.step()
+                else:
+                    loss_D = loss_D.detach()
+
+                if not grad_enabled:
+                    loss_G = loss_G.detach()
+                    loss_D = loss_D.detach()
+                    cls_loss = cls_loss.detach()
+                    contrastive_loss = contrastive_loss.detach()
+
+                LOGGER.info(
+                    "[GRADS] adv=%.6e | cycle=%.6e | identity=%.6e | cls=%.6e | con=%.6e || "
+                    "G_H2R=%.6e | G_R2H=%.6e | Proj=%.6e",
+                    grad_adv,
+                    grad_cycle,
+                    grad_identity,
+                    grad_cls,
+                    grad_con,
+                    grad_norm(G_H2R) if grad_enabled else 0.0,
+                    grad_norm(G_R2H) if grad_enabled else 0.0,
+                    grad_norm(projector) if grad_enabled else 0.0,
+                )
+
+                if args.profile_steps and device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                    t_end = time.perf_counter()
+                    mem_end = torch.cuda.memory_allocated(device)
+                    mem_peak = torch.cuda.max_memory_allocated(device)
+                    LOGGER.info(
+                        "Profile | epoch=%d step=%d | time=%.3fs | mem_start=%.1f MB | mem_end=%.1f MB | mem_peak=%.1f MB",
+                        epoch,
+                        step_idx,
+                        t_end - t_start,
+                        mem_start / (1024**2),
+                        mem_end / (1024**2),
+                        mem_peak / (1024**2),
+                    )
+
+                epoch_metrics["G"] += loss_G.item()
+                epoch_metrics["D"] += loss_D.item()
+                epoch_metrics["cls"] += cls_loss.item()
+                epoch_metrics["con"] += contrastive_loss.item()
+                epoch_metrics["cycle"] += cycle_loss.item()
+                epoch_metrics["identity"] += id_loss.item()
+                epoch_metrics["adv"] += adv_loss.item()
+                if progress:
+                    progress.update(1)
+
+        if progress:
+            progress.close()
 
         for key in epoch_metrics:
             epoch_metrics[key] /= max(1, batches)
@@ -1600,7 +2125,6 @@ def train(args: argparse.Namespace) -> None:
                 "test_acc": test_metrics.get("acc") if test_metrics else None,
             }
         )
-        history_path = run_dir / "history.json"
         with history_path.open("w", encoding="utf-8") as fp:
             json.dump(history, fp, indent=2)
 
@@ -1651,15 +2175,13 @@ def train(args: argparse.Namespace) -> None:
             save_checkpoints(
                 run_dir,
                 epoch,
-                {
-                    "G_H2R": G_H2R,
-                    "G_R2H": G_R2H,
-                    "Proj": projector,
-                },
+                module_states,
+                optimizer_states,
+                scaler_states,
             )
 
     plot_metrics(history, run_dir / "metrics.png")
-    LOGGER.info("Training complete. History saved to %s", run_dir / "history.json")
+    LOGGER.info("Training complete. History saved to %s", history_path)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

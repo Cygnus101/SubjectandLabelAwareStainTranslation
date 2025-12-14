@@ -330,6 +330,8 @@ def main(args):
         else:
             logging.info(f"Resuming from directory {resume_dir}")
     logging.info(f"Device: {device} | AMP: {use_amp}")
+    if args.split_json:
+        logging.info(f"Using explicit split file: {args.split_json}")
     logging.info(f"Hyperparameters: {vars(args)}")
 
     # --- Seed for reproducibility ---
@@ -350,6 +352,7 @@ def main(args):
         subset_order=args.subset_order,
         image_size=args.image_size,
         legacy_roots=args.legacy_root,
+        split_json=args.split_json,
     )
     logging.info(f"Train batches: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
     if len(train_loader) == 0:
@@ -668,6 +671,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(PROJECT_ROOT / METADATA_CSV),
         help="Path to metadata.csv",
     )
+    parser.add_argument(
+        "--split-json",
+        type=str,
+        default=None,
+        help="Optional JSON with explicit train/val/test stain indices (e.g., augmented_splits.json).",
+    )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=4, help="Ignored if --num-workers 0")
@@ -800,6 +809,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.metadata = _resolve_path(args.metadata)
+    args.split_json = _resolve_path(args.split_json) if args.split_json else None
     args.checkpoints_dir = _resolve_path(args.checkpoints_dir)
     args.logs_dir = _resolve_path(args.logs_dir)
     args.samples_dir = _resolve_path(args.samples_dir)
