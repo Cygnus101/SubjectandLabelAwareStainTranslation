@@ -76,18 +76,6 @@ class SlideRecord:
         return f"{self.lab_id}|{self.he_stain_id}|{self.ret_stain_id}"
 
 
-@dataclass
-class AugmentedSlide:
-    lab_id: str
-    he_stain_id: str
-    ret_stain_id: str
-    grade: int
-    he_paths: list[Path]
-    he_top_flags: list[int]
-    ret_paths: list[Path]
-    ret_top_flags: list[int]
-
-
 def _numeric_tokens(value: str) -> list[int]:
     return [int(match.group()) for match in re.finditer(r"\d+", value)]
 
@@ -123,83 +111,6 @@ def _closest_stain_id(source: str, candidates: Sequence[str]) -> Optional[str]:
         return (prefix_penalty, diff, candidate)
 
     return min(candidates, key=score)
-
-
-def _resolve_patch_path(raw: str, data_root: Optional[Path]) -> Path:
-    path = Path(str(raw))
-    if path.is_absolute():
-        return path
-    base = Path(data_root) if data_root else PROJECT_ROOT
-    return (base / path).resolve()
-
-
-def load_augmented_slides(slides_path: Path, data_root: Optional[Path]) -> list[AugmentedSlide]:
-    payload = json.loads(Path(slides_path).read_text("utf-8"))
-    if not isinstance(payload, list):
-        raise ValueError(f"Serialized slides file {slides_path} must contain a list.")
-    slides: list[AugmentedSlide] = []
-    for entry in payload:
-        try:
-            lab_id = str(entry["lab_id"])
-            he_id = str(entry["he_stain_id"])
-            ret_id = str(entry["ret_stain_id"])
-            grade = int(entry["grade"])
-            he_meta = entry.get("he_patches", [])
-            ret_meta = entry.get("ret_patches", [])
-        except KeyError as exc:
-            raise ValueError(f"Slide entry missing required field: {exc}") from exc
-        he_paths: list[Path] = []
-        he_flags: list[int] = []
-        for patch in he_meta:
-            he_paths.append(_resolve_patch_path(patch["patch_path"], data_root))
-            he_flags.append(int(patch.get("is_top10", 0)))
-        ret_paths: list[Path] = []
-        ret_flags: list[int] = []
-        for patch in ret_meta:
-            ret_paths.append(_resolve_patch_path(patch["patch_path"], data_root))
-            ret_flags.append(int(patch.get("is_top10", 0)))
-        if len(he_flags) < len(he_paths):
-            he_flags.extend([0] * (len(he_paths) - len(he_flags)))
-        if len(ret_flags) < len(ret_paths):
-            ret_flags.extend([0] * (len(ret_paths) - len(ret_flags)))
-        he_flags = he_flags[: len(he_paths)]
-        ret_flags = ret_flags[: len(ret_paths)]
-        if not he_paths or not ret_paths:
-            continue
-        slides.append(
-            AugmentedSlide(
-                lab_id=lab_id,
-                he_stain_id=he_id,
-                ret_stain_id=ret_id,
-                grade=grade,
-                he_paths=he_paths,
-                he_top_flags=he_flags,
-                ret_paths=ret_paths,
-                ret_top_flags=ret_flags,
-            )
-        )
-    if not slides:
-        raise RuntimeError(f"No slides loaded from {slides_path}")
-    LOGGER.info("Loaded %d serialized slide(s) from %s", len(slides), slides_path)
-    return slides
-
-
-def load_augmented_splits(split_path: Path) -> dict[str, list[int]]:
-    payload = json.loads(Path(split_path).read_text("utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"Split file {split_path} must contain a mapping.")
-
-    def _extract(key: str) -> list[int]:
-        values = payload.get(key, [])
-        if values is None:
-            return []
-        return [int(v) for v in values]
-
-    return {
-        "train": _extract("train_indices"),
-        "val": _extract("val_indices"),
-        "test": _extract("test_indices"),
-    }
 
 
 def _parse_grade(value: object) -> Optional[int]:
@@ -488,124 +399,6 @@ class SlidePatchDataset(Dataset):
             legacy_roots=legacy_roots,
             entries=records,
         )
-
-
-class AugmentedSlideDataset(Dataset):
-    def __init__(
-        self,
-        slides: list[AugmentedSlide],
-        patches_per_slide: int,
-        image_size: int,
-        augment: bool,
-        seed: int,
-        patch_retries: int = 8,
-        top_fraction: float = 0.25,
-    ) -> None:
-        if not slides:
-            raise ValueError("AugmentedSlideDataset received an empty slide list.")
-        self.entries = slides
-        self.seed = seed
-        self.patches_per_slide = patches_per_slide
-        self.patch_retries = max(1, patch_retries)
-        self.top_fraction = max(0.0, min(1.0, float(top_fraction)))
-        self.train_transform = _build_patch_transform(image_size, augment)
-        self.eval_transform = _build_patch_transform(image_size, augment=False)
-
-    def __len__(self) -> int:
-        return len(self.entries)
-
-    def _sample_indices(
-        self, total: int, flags: Sequence[int], deterministic: bool
-    ) -> list[int]:
-        if total <= 0:
-            raise RuntimeError("Slide contains no patches.")
-        if deterministic:
-            indices = list(range(min(total, self.patches_per_slide)))
-            while len(indices) < self.patches_per_slide:
-                indices.append(indices[-1] if indices else 0)
-            return indices[: self.patches_per_slide]
-
-        top_indices = [i for i, flag in enumerate(flags) if flag]
-        all_indices = list(range(total))
-        k_top = int(round(self.patches_per_slide * self.top_fraction))
-        if self.top_fraction > 0.0:
-            k_top = max(1, k_top)
-        else:
-            k_top = 0
-        k_top = min(k_top, self.patches_per_slide)
-        k_rest = self.patches_per_slide - k_top
-
-        def _draw(pool: list[int], count: int) -> list[int]:
-            if count <= 0:
-                return []
-            if not pool:
-                pool = all_indices
-            idx = torch.randint(
-                0, len(pool), (count,), dtype=torch.long
-            ).tolist()
-            return [pool[i] for i in idx]
-
-        selected = _draw(top_indices or all_indices, k_top)
-        selected += _draw(all_indices, k_rest)
-        return selected
-
-    def _load_stack(
-        self,
-        paths: Sequence[Path],
-        indices: list[int],
-        transform: T.Compose,
-        allow_repeat: bool,
-    ) -> torch.Tensor:
-        images: list[torch.Tensor] = []
-        attempts = 0
-        max_attempts = self.patch_retries * max(1, len(indices))
-        total = len(paths)
-        if total == 0:
-            raise RuntimeError("Slide has no patch paths.")
-        pointer = 0
-        while len(images) < len(indices) and attempts < max_attempts:
-            idx = indices[pointer]
-            pointer = (pointer + 1) % len(indices)
-            path = paths[idx % total]
-            try:
-                with Image.open(path) as img:
-                    tensor = transform(img.convert("RGB"))
-            except (FileNotFoundError, UnidentifiedImageError, OSError) as exc:
-                LOGGER.warning("Failed to load patch %s (%s)", path, exc)
-                if allow_repeat:
-                    indices[pointer - 1] = torch.randint(0, total, (1,), dtype=torch.long).item()
-                attempts += 1
-                continue
-            images.append(tensor)
-        if len(images) < len(indices):
-            raise RuntimeError("Unable to collect enough patches for a slide.")
-        return torch.stack(images, dim=0)
-
-    def get_slide(
-        self,
-        idx: int,
-        *,
-        deterministic: bool = False,
-    ):
-        record = self.entries[idx]
-        he_indices = self._sample_indices(
-            len(record.he_paths), record.he_top_flags, deterministic
-        )
-        ret_indices = self._sample_indices(
-            len(record.ret_paths), record.ret_top_flags, deterministic
-        )
-        transform = self.eval_transform if deterministic else self.train_transform
-        he_stack = self._load_stack(
-            record.he_paths, he_indices, transform, allow_repeat=not deterministic
-        )
-        ret_stack = self._load_stack(
-            record.ret_paths, ret_indices, transform, allow_repeat=not deterministic
-        )
-        grade = torch.tensor(record.grade, dtype=torch.long)
-        return he_stack, ret_stack, grade, record.ret_stain_id
-
-    def __getitem__(self, idx: int):
-        return self.get_slide(idx)
 
 
 class SlideEmbeddingBank:
@@ -1164,51 +957,12 @@ def infer_feature_dim(encoder: nn.Module, sample: torch.Tensor, mean: torch.Tens
     return feats.shape[1]
 
 
-def save_checkpoints(
-    run_dir: Path,
-    epoch: int,
-    modules: dict[str, nn.Module],
-    optimizers: dict[str, torch.optim.Optimizer | None],
-    scalers: dict[str, GradScaler | None],
-) -> None:
+def save_checkpoints(run_dir: Path, epoch: int, modules: dict[str, nn.Module]) -> None:
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, Any] = {"epoch": epoch}
     for name, module in modules.items():
-        payload[name] = module.state_dict()
-    for name, opt in optimizers.items():
-        if opt is not None:
-            payload[name] = opt.state_dict()
-    for name, scaler in scalers.items():
-        if scaler is not None:
-            payload[name] = scaler.state_dict()
-    path = ckpt_dir / f"train_state_epoch{epoch}.pt"
-    torch.save(payload, path)
-
-
-def load_checkpoints(
-    run_dir: Path,
-    epoch: int,
-    modules: dict[str, nn.Module],
-    optimizers: dict[str, torch.optim.Optimizer | None],
-    scalers: dict[str, GradScaler | None],
-) -> None:
-    ckpt_dir = Path(run_dir) / "checkpoints"
-    path = ckpt_dir / f"train_state_epoch{epoch}.pt"
-    if not path.exists():
-        raise FileNotFoundError(f"Checkpoint {path} not found.")
-    state = torch.load(path, map_location="cpu")
-    for name, module in modules.items():
-        payload = state.get(name)
-        if payload is None:
-            raise KeyError(f"Checkpoint missing state for module {name}.")
-        module.load_state_dict(payload)
-    for name, opt in optimizers.items():
-        if opt is not None and name in state:
-            opt.load_state_dict(state[name])
-    for name, scaler in scalers.items():
-        if scaler is not None and name in state:
-            scaler.load_state_dict(state[name])
+        path = ckpt_dir / f"{name}_epoch{epoch}.pt"
+        torch.save({"state_dict": module.state_dict()}, path)
 
 
 def _load_cli_defaults(config_path: Optional[str]) -> dict[str, Any]:
@@ -1251,18 +1005,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--metadata", type=str, default=str(PROJECT_ROOT / "metadata.csv"))
     parser.add_argument("--data-root", type=str, default=None)
-    parser.add_argument(
-        "--augmented-slides",
-        type=str,
-        required=True,
-        help="Path to augmented_slides.json produced by build_augmented_dataset.py",
-    )
-    parser.add_argument(
-        "--augmented-splits",
-        type=str,
-        required=True,
-        help="Path to augmented_splits.json produced by build_augmented_dataset.py",
-    )
     parser.add_argument("--batch-slides", type=int, default=2)
     parser.add_argument("--patches-per-slide", type=int, default=32)
     parser.add_argument("--lambda-cycle", type=float, default=50.0)
@@ -1383,24 +1125,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Whether to enable gradient computation/backprop (set to false for inference-only runs).",
     )
-    parser.add_argument(
-        "--top-fraction",
-        type=float,
-        default=0.25,
-        help="Fraction of patches drawn from the top attention pool (default 0.25).",
-    )
-    parser.add_argument(
-        "--resume-dir",
-        type=str,
-        default=None,
-        help="Optional run directory to resume from (expects checkpoints there).",
-    )
-    parser.add_argument(
-        "--resume-epoch",
-        type=int,
-        default=None,
-        help="Epoch number to resume from (requires --resume-dir).",
-    )
     parser.set_defaults(**config_defaults)
     args = parser.parse_args(argv)
 
@@ -1428,10 +1152,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise ValueError("--val-ratio and --test-ratio must be within [0, 1).")
     if args.val_ratio + args.test_ratio >= 0.95:
         raise ValueError("val_ratio + test_ratio must be less than 0.95 to leave room for training.")
-    if not (0.0 <= args.top_fraction <= 1.0):
-        raise ValueError("--top-fraction must be within [0, 1].")
-    if (args.resume_dir and args.resume_epoch is None) or (args.resume_epoch and not args.resume_dir):
-        raise ValueError("--resume-dir and --resume-epoch must be provided together.")
     required = [
         "pretrained_cyclegan",
         "pretrained_encoder",
@@ -1452,8 +1172,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.metadata = str(resolve_path(args.metadata))
     if args.data_root:
         args.data_root = str(resolve_path(args.data_root, allow_missing=True))
-    args.augmented_slides = str(resolve_path(args.augmented_slides))
-    args.augmented_splits = str(resolve_path(args.augmented_splits))
     args.log_dir = str(resolve_path(args.log_dir, allow_missing=True))
     args.samples_dir = str(resolve_path(args.samples_dir, allow_missing=True))
     if args.cache_embedding_bank:
@@ -1461,8 +1179,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.cache_index:
         args.cache_index = str(resolve_path(args.cache_index, allow_missing=True))
     args.grad_req = _bool_arg(args.grad_req)
-    if args.resume_dir:
-        args.resume_dir = str(resolve_path(args.resume_dir, allow_missing=True))
     if args.legacy_root:
         # Resolve legacy roots but allow them to be missing on the current machine;
         # we only use them for prefix-stripping and remapping.
@@ -1515,40 +1231,20 @@ def train(args: argparse.Namespace) -> None:
             "Slide-level contrastive training now requires --reticulin-embedding-dir "
             "with precomputed reticulin embeddings."
         )
-    slides = load_augmented_slides(
-        Path(args.augmented_slides),
-        Path(args.data_root) if args.data_root else None,
-    )
-    dataset = AugmentedSlideDataset(
-        slides=slides,
-        patches_per_slide=args.patches_per_slide,
-        image_size=args.image_size,
-        augment=not args.no_augment,
-        seed=args.seed,
-        patch_retries=args.patch_retries,
-        top_fraction=args.top_fraction,
-    )
-    splits = load_augmented_splits(Path(args.augmented_splits))
 
-    def _build_subset(indices: list[int]) -> Subset | None:
-        if not indices:
-            return None
-        return Subset(dataset, indices)
+    metadata_dataset: SlidePatchDataset | None = None
 
-    train_subset = _build_subset(splits["train"])
-    if train_subset is None:
-        raise RuntimeError("Training indices list is empty; cannot start training.")
-    val_subset = _build_subset(splits["val"])
-    test_subset = _build_subset(splits["test"])
-
-    train_loader = build_dataloader(train_subset, args, shuffle=True)
-    val_loader = build_dataloader(val_subset, args, shuffle=False) if val_subset else None
-    test_loader = build_dataloader(test_subset, args, shuffle=False) if test_subset else None
-    dataset_for_preview = dataset
+    def ensure_dataset() -> SlidePatchDataset:
+        nonlocal metadata_dataset
+        if metadata_dataset is None:
+            metadata_dataset = build_dataset(args)
+            LOGGER.info("Slides available before filtering: %d", len(metadata_dataset))
+        return metadata_dataset
 
     embedding_bank = _load_cache(args.cache_embedding_bank, "embedding bank", args.no_cache)
     if embedding_bank is None:
-        embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset)
+        dataset_for_bank = ensure_dataset()
+        embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset_for_bank)
         LOGGER.info(
             "Embedding bank covers %d slide(s); slides without embeddings will be skipped in contrastive loss.",
             len(embedding_bank.slide_ids),
@@ -1560,12 +1256,48 @@ def train(args: argparse.Namespace) -> None:
             len(embedding_bank.slide_ids),
         )
 
-    LOGGER.info(
-        "Slide counts | train=%d | val=%d | test=%d",
-        len(splits["train"]),
-        len(splits["val"]),
-        len(splits["test"]),
-    )
+    index_cache = _load_cache(args.cache_index, "augment index", args.no_cache)
+
+    def dataset_from_entries(entries: list[dict[str, Any]] | None) -> SlidePatchDataset | None:
+        if not entries:
+            return None
+        return SlidePatchDataset.from_serialized(entries, args)
+
+    if index_cache is not None:
+        LOGGER.info("Using cached dataset index.")
+        train_dataset = dataset_from_entries(index_cache.get("train"))
+        if train_dataset is None:
+            raise RuntimeError("Cached index missing training entries.")
+        val_dataset = dataset_from_entries(index_cache.get("val"))
+        test_dataset = dataset_from_entries(index_cache.get("test"))
+        train_loader = build_dataloader(train_dataset, args, shuffle=True)
+        val_loader = (
+            build_dataloader(val_dataset, args, shuffle=False) if val_dataset is not None else None
+        )
+        test_loader = (
+            build_dataloader(test_dataset, args, shuffle=False) if test_dataset is not None else None
+        )
+        dataset_for_preview: SlidePatchDataset = train_dataset
+    else:
+        dataset = ensure_dataset()
+        allowed_ids = set(embedding_bank.slide_ids)
+        removed = dataset.filter_slides(allowed_ids)
+        if removed:
+            LOGGER.info("Filtered %d slide(s) missing embeddings; %d remain.", removed, len(dataset))
+        loaders, split_indices = build_split_loaders(dataset, args, return_indices=True)
+        train_loader = loaders["train"]
+        if train_loader is None:
+            raise RuntimeError("Training loader is empty after filtering; cannot proceed.")
+        val_loader = loaders.get("val")
+        test_loader = loaders.get("test")
+        dataset_for_preview = dataset
+        if args.cache_index and not args.no_cache:
+            serialized = {
+                split: dataset.serialize_entries(indices) if indices else []
+                for split, indices in split_indices.items()
+            }
+            _save_cache(serialized, args.cache_index, "augment index", args.no_cache)
+
     LOGGER.info(
         "Loader sizes | train: %s | val: %s | test: %s",
         len(train_loader),
@@ -1638,61 +1370,22 @@ def train(args: argparse.Namespace) -> None:
     scaler_D = GradScaler(enabled=use_amp)
     amp_context = autocast if use_amp else nullcontext
     grad_modules = (G_H2R, G_R2H, projector)
-    module_states = {
-        "G_H2R": G_H2R,
-        "G_R2H": G_R2H,
-        "Proj": projector,
-        "D_R": D_R,
-        "D_H": D_H,
-    }
-    optimizer_states = {"opt_G": opt_G if grad_enabled else None, "opt_D": opt_D if grad_enabled else None}
-    scaler_states = {
-        "scaler_G": scaler_G if use_amp else None,
-        "scaler_D": scaler_D if use_amp else None,
-    }
-
-    start_epoch = 1
-    if args.resume_dir:
-        load_checkpoints(
-            Path(args.resume_dir),
-            int(args.resume_epoch),
-            module_states,
-            optimizer_states,
-            scaler_states,
-        )
-        start_epoch = int(args.resume_epoch) + 1
-        LOGGER.info("Resuming training from epoch %d (next epoch %d).", args.resume_epoch, start_epoch)
-    if start_epoch > args.epochs:
-        LOGGER.info(
-            "Start epoch (%d) exceeds configured epochs (%d); no training to run.",
-            start_epoch,
-            args.epochs,
-        )
-        return
 
     samples_dir.mkdir(parents=True, exist_ok=True)
 
-    history_path = run_dir / "history.json"
     history: list[dict[str, float]] = []
-    if args.resume_dir and Path(args.resume_dir) == run_dir and history_path.exists():
-        try:
-            history = json.loads(history_path.read_text("utf-8"))
-        except Exception as exc:
-            LOGGER.warning("Failed to load existing history from %s (%s).", history_path, exc)
-            history = []
     preview_he: torch.Tensor | None = None
     preview_ret: torch.Tensor | None = None
-    preview_index = splits["train"][0] if splits["train"] else 0
     try:
-        he_stack, ret_stack, _, _ = dataset_for_preview.get_slide(preview_index, deterministic=True)
+        he_stack, ret_stack, _, _ = dataset_for_preview.get_slide(0, deterministic=True)  # type: ignore[attr-defined]
         # he_stack: [P, C, H, W] -> add a slide dimension -> [1, P, C, H, W]
         preview_he = he_stack.unsqueeze(0).to(device, non_blocking=True)
         preview_ret = ret_stack.unsqueeze(0).to(device, non_blocking=True)
     except Exception as exc:
         LOGGER.warning("Unable to collect preview samples (%s); skipping sample grids.", exc)
 
-    step_idx = max(0, start_epoch - 1) * len(train_loader)
-    for epoch in range(start_epoch, args.epochs + 1):
+    step_idx = 0
+    for epoch in range(1, args.epochs + 1):
         G_H2R.train()
         G_R2H.train()
         D_R.train()
@@ -1907,6 +1600,7 @@ def train(args: argparse.Namespace) -> None:
                 "test_acc": test_metrics.get("acc") if test_metrics else None,
             }
         )
+        history_path = run_dir / "history.json"
         with history_path.open("w", encoding="utf-8") as fp:
             json.dump(history, fp, indent=2)
 
@@ -1957,13 +1651,15 @@ def train(args: argparse.Namespace) -> None:
             save_checkpoints(
                 run_dir,
                 epoch,
-                module_states,
-                optimizer_states,
-                scaler_states,
+                {
+                    "G_H2R": G_H2R,
+                    "G_R2H": G_R2H,
+                    "Proj": projector,
+                },
             )
 
     plot_metrics(history, run_dir / "metrics.png")
-    LOGGER.info("Training complete. History saved to %s", history_path)
+    LOGGER.info("Training complete. History saved to %s", run_dir / "history.json")
 
 
 def main(argv: Sequence[str] | None = None) -> None:
