@@ -10,7 +10,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Iterable, Iterator, Optional, Sequence
+from typing import Iterator, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -158,6 +158,16 @@ def run(args: argparse.Namespace) -> None:
     logging.info("Embeddings will be saved to %s", output_root)
 
     df = pd.read_csv(metadata_path)
+    if args.split_json:
+        split_path = resolve_path(args.split_json)
+        slides_json = resolve_path(args.augmented_slides)
+        allowed = _load_allowed_labs(split_path, slides_json)
+        lab_col = _detect_lab_column(df)
+        if lab_col is None:
+            raise ValueError("metadata CSV missing lab column required for split filtering.")
+        before = len(df)
+        df = df[df[lab_col].astype(str).str.strip().isin(allowed)].reset_index(drop=True)
+        logging.info("Filtered by split JSON %s → %d/%d rows remain", split_path, len(df), before)
     if args.filter_types:
         allowed = {t.lower() for t in args.filter_types}
         df = df[df["type"].str.lower().isin(allowed)]
@@ -225,29 +235,88 @@ def run(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    # Two-pass parsing: first read --config (if any), then apply config as defaults.
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional path to a JSON config file. Values become defaults; CLI flags override.",
+    )
+    pre_args, _ = pre_parser.parse_known_args(argv)
+
+    config: dict = {}
+    if pre_args.config:
+        cfg_path = Path(pre_args.config).expanduser().resolve()
+        try:
+            config = json.loads(cfg_path.read_text("utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read config JSON from {cfg_path}: {exc}")
+
+        if not isinstance(config, dict):
+            raise ValueError(f"Config at {cfg_path} must be a JSON object (dict).")
+
     parser = argparse.ArgumentParser(description="Extract patch embeddings using a trained SimCLR encoder.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=pre_args.config,
+        help="Optional path to a JSON config file. Values become defaults; CLI flags override.",
+    )
+
+    # Core paths
     parser.add_argument("--metadata", type=str, default=str(PROJECT_ROOT / "metadata.csv"))
     parser.add_argument("--root", type=str, default=None, help="Primary root directory for relative patch paths.")
     parser.add_argument("--legacy-root", action="append", default=[], help="Additional roots to search for patches.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to SimCLR checkpoint (.pt).")
+    parser.add_argument("--split-json", type=str, default=None, help="Optional split JSON to restrict stain IDs.")
+    parser.add_argument("--augmented-slides", type=str, default=str(PROJECT_ROOT / "augmented_slides.json"), help="Slides JSON used to map split indices to lab IDs.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to SimCLR checkpoint (.pt).")
+
+    # Model params
     parser.add_argument("--backbone", type=str, default="resnet50", choices=sorted(MODEL_REGISTRY.keys()))
     parser.add_argument("--proj-hidden-dim", type=int, default=2048)
     parser.add_argument("--proj-out-dim", type=int, default=128)
-    parser.add_argument("--output-dir", type=str, required=True, help="Directory to store embeddings (.npy).")
+
+    # Output
+    parser.add_argument("--output-dir", type=str, default=None, help="Directory to store embeddings (.npy).")
+
+    # Data selection
     parser.add_argument("--subset", type=float, default=None, help="Optional random fraction of rows to process (0-1].")
     parser.add_argument("--filter-types", nargs="*", default=None, help="Optional list of stain types to keep.")
+
+    # Runtime
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--max-retries", type=int, default=5, help="Retries for missing/unreadable patches.")
     parser.add_argument("--device", type=str, default=None, help="Device override (cuda, mps, cpu).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", type=str, default="INFO")
+
+    # Apply config values as defaults (CLI flags override these).
+    if config:
+        # Allow both snake_case and kebab-case keys in config.
+        normalized: dict = {}
+        for k, v in config.items():
+            if not isinstance(k, str):
+                continue
+            normalized[k.replace("-", "_")] = v
+        parser.set_defaults(**normalized)
+
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
+
+    if getattr(args, "config", None):
+        logging.info("Loaded config from %s (CLI args may override config values).", args.config)
+
+    # Validate required args after config + CLI merge
+    if not args.checkpoint:
+        raise SystemExit("Missing required argument: --checkpoint (provide via CLI or config JSON)")
+    if not args.output_dir:
+        raise SystemExit("Missing required argument: --output-dir (provide via CLI or config JSON)")
 
     if args.device is None:
         if torch.cuda.is_available():

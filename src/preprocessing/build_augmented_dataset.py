@@ -106,7 +106,13 @@ def _apply_subset(df: pd.DataFrame, subset_pct: float | None, order: str, rng: r
     return df[df["lab_id"].isin(selected)].copy()
 
 
-def build_slide_records(metadata_path: Path, attention_path: Path, subset_pct: float | None, subset_order: str, seed: int) -> list[SlideRecord]:
+def build_slide_records(
+    metadata_path: Path,
+    attention_path: Path | None,
+    subset_pct: float | None,
+    subset_order: str,
+    seed: int,
+) -> list[SlideRecord]:
     rng = random.Random(seed)
     df = pd.read_csv(metadata_path)
     required_cols = {"Lab No.", "stain_id", "type", "patch_path", "Reticulin Grade"}
@@ -119,7 +125,7 @@ def build_slide_records(metadata_path: Path, attention_path: Path, subset_pct: f
     df = df[df["lab_id"].astype(bool)]
     df = _apply_subset(df, subset_pct, subset_order, rng)
 
-    attention_lookup = _load_attention_lookup(attention_path)
+    attention_lookup = _load_attention_lookup(attention_path) if attention_path else {}
     slides: list[SlideRecord] = []
 
     for lab_id, lab_df in df.groupby("lab_id"):
@@ -129,14 +135,22 @@ def build_slide_records(metadata_path: Path, attention_path: Path, subset_pct: f
             continue
         he_groups = {str(sid): group for sid, group in he_df.groupby("stain_id")}
         ret_groups = {str(sid): group for sid, group in ret_df.groupby("stain_id")}
+
+        # Track which stain IDs have already been used in a pair so we can add "ret-only" pairs
+        paired_he: set[str] = set()
+        paired_ret: set[str] = set()
+
+        # 1) Primary pairing: for each H&E stain, pick the closest Reticulin stain (existing behavior)
         for he_id, he_group in he_groups.items():
             ret_id = _closest_stain_id(he_id, list(ret_groups.keys()))
             if ret_id is None:
                 continue
             ret_group = ret_groups[ret_id]
+
             grade = _parse_grade(ret_group["Reticulin Grade"].iloc[0])
             if grade is None:
                 continue
+
             he_paths = he_group["patch_path_norm"].astype(str).tolist()
             ret_paths = ret_group["patch_path_norm"].astype(str).tolist()
             if not he_paths or not ret_paths:
@@ -150,6 +164,7 @@ def build_slide_records(metadata_path: Path, attention_path: Path, subset_pct: f
                 {"patch_path": path, "is_top10": attention_lookup.get((ret_id, path), 0)}
                 for path in ret_paths
             ]
+
             slides.append(
                 SlideRecord(
                     lab_id=str(lab_id),
@@ -160,6 +175,52 @@ def build_slide_records(metadata_path: Path, attention_path: Path, subset_pct: f
                     ret_patches=ret_patches,
                 )
             )
+
+            paired_he.add(he_id)
+            paired_ret.add(ret_id)
+
+        # 2) Secondary pairing: for each Reticulin stain that didn't get used above,
+        #    map it to the closest available H&E stain in the same lab.
+        #    This retains Reticulin labels and prevents dropping Ret-only stains.
+        for ret_id, ret_group in ret_groups.items():
+            if ret_id in paired_ret:
+                continue
+
+            he_id = _closest_stain_id(ret_id, list(he_groups.keys()))
+            if he_id is None:
+                # No H&E stains exist in this lab (should be rare since we checked earlier)
+                continue
+
+            he_group = he_groups[he_id]
+            grade = _parse_grade(ret_group["Reticulin Grade"].iloc[0])
+            if grade is None:
+                continue
+
+            he_paths = he_group["patch_path_norm"].astype(str).tolist()
+            ret_paths = ret_group["patch_path_norm"].astype(str).tolist()
+            if not he_paths or not ret_paths:
+                continue
+
+            he_patches = [
+                {"patch_path": path, "is_top10": attention_lookup.get((he_id, path), 0)}
+                for path in he_paths
+            ]
+            ret_patches = [
+                {"patch_path": path, "is_top10": attention_lookup.get((ret_id, path), 0)}
+                for path in ret_paths
+            ]
+
+            slides.append(
+                SlideRecord(
+                    lab_id=str(lab_id),
+                    he_stain_id=he_id,
+                    ret_stain_id=ret_id,
+                    grade=grade,
+                    he_patches=he_patches,
+                    ret_patches=ret_patches,
+                )
+            )
+
     if not slides:
         raise RuntimeError("No eligible slides were constructed from metadata + attention inputs.")
     LOGGER.info("Constructed %d slide records.", len(slides))
@@ -175,70 +236,121 @@ def build_splits(
     test_ratio: float,
     seed: int,
 ) -> tuple[list[int], list[int], list[int]]:
-    train_set = {lab.strip() for lab in train_labs}
-    val_set = {lab.strip() for lab in val_labs}
-    test_set = {lab.strip() for lab in test_labs}
+    """Build lab-safe train/val/test splits.
+
+    Key change vs previous behavior:
+    - Ratios are enforced over the TOTAL number of labs (not just the remaining/unfixed labs).
+    - Any labs passed via train_labs/val_labs/test_labs are guaranteed to be included.
+    """
+
+    # Normalize + strip
+    train_set = {str(lab).strip() for lab in train_labs if str(lab).strip()}
+    val_set = {str(lab).strip() for lab in val_labs if str(lab).strip()}
+    test_set = {str(lab).strip() for lab in test_labs if str(lab).strip()}
+
     if train_set & val_set or train_set & test_set or val_set & test_set:
         LOGGER.warning("Overlap detected between train/val/test lab constraints; precedence train > val > test.")
-    val_fixed: list[int] = []
-    test_fixed: list[int] = []
-    train_fixed: list[int] = []
-    remaining: list[int] = []
+
+    # Slide indices by lab
+    by_lab: dict[str, list[int]] = {}
     for idx, slide in enumerate(slides):
-        lab = slide.lab_id
+        by_lab.setdefault(slide.lab_id, []).append(idx)
+
+    all_labs = sorted(by_lab.keys())
+    N = len(all_labs)
+    if N == 0:
+        raise RuntimeError("No labs found in constructed slides; cannot build splits.")
+
+    # Fixed assignments with precedence train > val > test
+    train_fixed: set[str] = set()
+    val_fixed: set[str] = set()
+    test_fixed: set[str] = set()
+
+    for lab in all_labs:
         if lab in train_set:
-            train_fixed.append(idx)
+            train_fixed.add(lab)
         elif lab in val_set:
-            val_fixed.append(idx)
+            val_fixed.add(lab)
         elif lab in test_set:
-            test_fixed.append(idx)
-        else:
-            remaining.append(idx)
+            test_fixed.add(lab)
+
+    remaining = [lab for lab in all_labs if lab not in (train_fixed | val_fixed | test_fixed)]
+
+    # Ratio targets over TOTAL labs
+    vr = max(0.0, min(0.9, float(val_ratio)))
+    tr = max(0.0, min(0.9, float(test_ratio)))
+
+    n_val_target = int(round(vr * N))
+    n_test_target = int(round(tr * N))
+
+    # Ensure fixed labs fit
+    n_val_target = max(n_val_target, len(val_fixed))
+    n_test_target = max(n_test_target, len(test_fixed))
+
+    # Ensure at least 1 train lab
+    n_train_target = N - n_val_target - n_test_target
+    if n_train_target < 1:
+        deficit = 1 - n_train_target
+        reducible_test = max(0, n_test_target - len(test_fixed))
+        take = min(reducible_test, deficit)
+        n_test_target -= take
+        deficit -= take
+
+        reducible_val = max(0, n_val_target - len(val_fixed))
+        take = min(reducible_val, deficit)
+        n_val_target -= take
+        deficit -= take
+
+        n_train_target = N - n_val_target - n_test_target
+        if n_train_target < 1:
+            raise RuntimeError(
+                "Unable to allocate at least 1 training lab given fixed constraints. "
+                "Reduce fixed val/test labs or ratios."
+            )
+
+    # Sample extra labs
+    n_val_extra = max(0, n_val_target - len(val_fixed))
+    n_test_extra = max(0, n_test_target - len(test_fixed))
 
     rng = random.Random(seed)
-    N = len(remaining)
+    rng.shuffle(remaining)
 
-    if N == 0:
-        if not train_fixed:
-            raise RuntimeError("No slides available for training after applying lab constraints.")
-        LOGGER.info(
-            "No remaining slides for random split; using fixed assignments (train=%d, val=%d, test=%d).",
-            len(train_fixed),
-            len(val_fixed),
-            len(test_fixed),
-        )
-        return train_fixed, val_fixed, test_fixed
+    val_extra = remaining[:n_val_extra]
+    test_extra = remaining[n_val_extra : n_val_extra + n_test_extra]
+    train_extra = remaining[n_val_extra + n_test_extra :]
 
-    n_val_extra = int(round(val_ratio * N))
-    n_test_extra = int(round(test_ratio * N))
-    max_allowed = max(0, N - 2)
-    if n_val_extra + n_test_extra > max_allowed:
-        overflow = n_val_extra + n_test_extra - max_allowed
-        reduce_test = min(n_test_extra, overflow)
-        n_test_extra -= reduce_test
-        overflow -= reduce_test
-        if overflow > 0:
-            n_val_extra = max(0, n_val_extra - overflow)
-    perm = remaining[:]
-    rng.shuffle(perm)
-    train_cut = len(perm) - n_val_extra - n_test_extra
-    train_indices = perm[:train_cut]
-    val_extra = perm[train_cut : train_cut + n_val_extra]
-    test_extra = perm[train_cut + n_val_extra :]
+    train_labs_final = sorted(train_fixed | set(train_extra))
+    val_labs_final = sorted(val_fixed | set(val_extra))
+    test_labs_final = sorted(test_fixed | set(test_extra))
 
-    train_all = train_fixed + train_indices
-    val_all = val_fixed + val_extra
-    test_all = test_fixed + test_extra
+    def _indices_for(labs: list[str]) -> list[int]:
+        out: list[int] = []
+        for lab in labs:
+            out.extend(by_lab.get(lab, []))
+        return out
 
-    if not train_all:
+    train_idx = _indices_for(train_labs_final)
+    val_idx = _indices_for(val_labs_final)
+    test_idx = _indices_for(test_labs_final)
+
+    if not train_idx:
         raise RuntimeError("Training split ended up empty. Adjust ratios or constraints.")
+
     LOGGER.info(
-        "Split sizes | train=%d | val=%d | test=%d",
-        len(train_all),
-        len(val_all),
-        len(test_all),
+        "Lab targets (total=%d) | train=%d | val=%d | test=%d",
+        N,
+        len(train_labs_final),
+        len(val_labs_final),
+        len(test_labs_final),
     )
-    return train_all, val_all, test_all
+    LOGGER.info(
+        "Slide indices | train=%d | val=%d | test=%d",
+        len(train_idx),
+        len(val_idx),
+        len(test_idx),
+    )
+
+    return train_idx, val_idx, test_idx
 
 
 def _load_config(path: str | None) -> dict[str, Any]:
@@ -268,7 +380,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description=__doc__, parents=[base_parser])
     parser.add_argument("--metadata", type=Path, default=Path("metadata.csv"))
-    parser.add_argument("--attention-csv", type=Path, default=Path("attention_with_top10.csv"))
+    parser.add_argument(
+        "--attention-csv",
+        type=Path,
+        default=None,
+        help="Optional attention CSV to mark top-k patches; omit to skip.",
+    )
     parser.add_argument("--output-slides", type=Path, default=Path("augmented_slides.json"))
     parser.add_argument("--output-splits", type=Path, default=Path("augmented_splits.json"))
     parser.add_argument("--subset-pct", type=float, default=None)

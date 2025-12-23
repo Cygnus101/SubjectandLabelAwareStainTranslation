@@ -77,7 +77,7 @@ class UNetGenerator(nn.Module):
 # --- 2. DISCRIMINATOR (PatchGAN) ---
 class Discriminator(nn.Module):
     """The PatchGAN Discriminator network (critic)."""
-    def __init__(self, in_channels=3, features=[64, 128, 256, 512]):
+    def __init__(self, in_channels=3, features=[32, 64, 128, 256]):
         super().__init__()
         self.model = nn.Sequential(
             nn.Conv2d(in_channels, features[0], kernel_size=4, stride=2, padding=1, padding_mode="reflect"),

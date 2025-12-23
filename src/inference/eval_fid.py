@@ -37,7 +37,7 @@ from utils.path import ensure_project_root_on_syspath, get_project_root, resolve
 
 ensure_project_root_on_syspath()
 
-from src.models.Backbone_model.CycleGANv3 import UNetGenerator
+from src.models.Backbone_model.CycleGAN import UNetGenerator
 
 PROJECT_ROOT = get_project_root()
 DEFAULT_METADATA = PROJECT_ROOT / "metadata.csv"
@@ -222,9 +222,18 @@ def _save_canvas(canvas: Image.Image, path: Path, downsample: float = 1.0) -> No
 def load_generator(checkpoint_path: Path, device: torch.device) -> UNetGenerator:
     generator = UNetGenerator().to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
-    state = ckpt.get("state_dict") or ckpt
+
+
+    if isinstance(ckpt, dict) and "G_H2R" in ckpt:
+        state = ckpt["G_H2R"]
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        logging.info("Loaded G_H2R from train_state checkpoint %s", checkpoint_path)
+    else:
+        state = ckpt.get("state_dict") or ckpt
+        logging.info("Loaded generator checkpoint %s", checkpoint_path)
+
     generator.load_state_dict(state)
-    logging.info("Loaded generator checkpoint %s", checkpoint_path)
     return generator
 
 
@@ -238,7 +247,15 @@ def _discover_checkpoints(single: Path | None, root: Path | None) -> list[Path]:
         checkpoints.append(resolve_path(single))
     else:
         base = resolve_path(root)
-        patterns = ["G_H2R*.pth", "G_H2R*.pth.tar", "G_H2R*.pt", "G_H2R*.ckpt"]
+        patterns = [
+            "G_H2R*.pth",
+            "G_H2R*.pth.tar",
+            "G_H2R*.pt",
+            "G_H2R*.ckpt",
+            "train_state_epoch*.pt",       # ← add this
+            "train_state_epoch*.pth",      # ← optional
+            "train_state_epoch*.pth.tar",  # ← optional
+        ]
         for pattern in patterns:
             checkpoints.extend(base.rglob(pattern))
         checkpoints = sorted({p.resolve() for p in checkpoints})

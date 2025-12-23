@@ -12,9 +12,6 @@ import logging
 import re
 import random
 import sys
-import gc
-import os
-import signal
 from contextlib import ExitStack, nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +40,7 @@ ensure_project_root_on_syspath()
 PROJECT_ROOT = get_project_root()
 
 # --- Import your custom modules ---
-from src.models.Backbone_model.CycleGANv3 import UNetGenerator, Discriminator
+from src.models.Backbone_model.CycleGAN import UNetGenerator, Discriminator
 from data.build_cyclegan_dataset import (
     make_loaders_from_metadata,
     METADATA_CSV,
@@ -59,76 +56,6 @@ DEFAULT_SAMPLES_DIR = DEFAULT_OUTPUTS_DIR / "samples" / "cyclegan"
 CHECKPOINT_PREFIXES = ("G_H2R", "G_R2H", "D_H", "D_R")
 HISTORY_FILENAME = "history.json"
 PREVIEW_SAMPLE_COUNT = 9
-DEFAULT_TRAIN_CONFIG = PROJECT_ROOT / "configs" / "train_cyclegan.json"
-
-
-def _flatten_config_dict(data: dict) -> dict:
-    flat: dict = {}
-    for key, value in data.items():
-        normalized_key = key.replace("-", "_")
-        if isinstance(value, dict):
-            flat.update(_flatten_config_dict(value))
-        else:
-            flat[normalized_key] = value
-    return flat
-
-
-def _load_train_config(path_str: str | None) -> dict[str, object]:
-    if not path_str:
-        return {}
-    try:
-        path = Path(resolve_path(path_str, allow_missing=True)).expanduser()
-    except Exception:
-        path = Path(path_str).expanduser()
-    if not path.exists():
-        return {}
-    try:
-        text = path.read_text("utf-8").strip()
-    except Exception as exc:
-        logging.warning("Unable to read config file %s: %s", path, exc)
-        return {}
-    if not text:
-        return {}
-    try:
-        raw = json.loads(text)
-    except Exception as exc:
-        logging.warning("Failed to parse config %s: %s", path, exc)
-        return {}
-    if not isinstance(raw, dict):
-        logging.warning("Train config %s must contain a mapping of keys.", path)
-        return {}
-    return _flatten_config_dict(raw)
-
-
-def _apply_config_defaults(parser: argparse.ArgumentParser, config_values: dict[str, object]) -> dict[str, object]:
-    if not config_values:
-        return {}
-    valid_keys = {action.dest for action in parser._actions if action.dest is not argparse.SUPPRESS}
-    applied: dict[str, object] = {}
-    for key, value in config_values.items():
-        if key in valid_keys and value is not None:
-            applied[key] = value
-        else:
-            logging.debug("Ignoring unknown or null config key '%s'.", key)
-    if applied:
-        parser.set_defaults(**applied)
-    return applied
-
-
-def _extract_config_path(argv: list[str] | None) -> str:
-    default = str(DEFAULT_TRAIN_CONFIG)
-    tokens = list(argv) if argv is not None else sys.argv[1:]
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
-        if token == "--config":
-            if i + 1 < len(tokens):
-                return tokens[i + 1]
-            break
-        if token.startswith("--config="):
-            return token.split("=", 1)[1]
-        i += 1
-    return default
 
 # ==============================================================================
 # Replay Buffer (stabilizes discriminator training)
@@ -354,31 +281,6 @@ def _build_profiler_context(args, device: torch.device):
 # ==============================================================================
 # Training Function
 # ==============================================================================
-def _is_cuda_oom(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return (
-        "out of memory" in msg
-        or "cuda out of memory" in msg
-        or "cublas" in msg and "alloc" in msg
-    )
-
-
-def _best_effort_cuda_cleanup(device: torch.device) -> None:
-    """Best-effort cleanup to reduce allocator fragmentation after errors.
-
-    Note: this cannot free memory held by *other* processes or a wedged driver context,
-    but it helps avoid hard kills on recoverable OOMs.
-    """
-    try:
-        gc.collect()
-        if device.type == "cuda" and torch.cuda.is_available():
-            # Do NOT call synchronize() here; it can hang if the driver is wedged.
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-    except Exception:
-        pass
-
-
 def main(args):
     # --- Setup device & directories ---
     if torch.cuda.is_available():
@@ -391,22 +293,6 @@ def main(args):
         device = torch.device("cpu")
         use_amp = False  # gate AMP on CUDA only
     autocast_ctx = (lambda: autocast("cuda")) if use_amp else nullcontext
-
-    stop_requested = {"flag": False}
-
-    def _request_stop(signum, frame):
-        stop_requested["flag"] = True
-        logging.warning(f"Received signal {signum}; will stop after current iteration and save state.")
-
-    for _sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            signal.signal(_sig, _request_stop)
-        except Exception:
-            pass
-
-    # Optional: slightly reduce nondeterministic / spiky cuDNN autotune memory behavior.
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
 
     checkpoints_dir = Path(args.checkpoints_dir)
     logs_dir = Path(args.logs_dir)
@@ -436,8 +322,6 @@ def main(args):
     )
 
     logging.info(f"Run ID: {args.run_id}")
-    if args.config:
-        logging.info(f"Config file: {args.config}")
     if resume_dir is not None:
         if resume_dir.name != args.run_id:
             logging.info(
@@ -446,8 +330,6 @@ def main(args):
         else:
             logging.info(f"Resuming from directory {resume_dir}")
     logging.info(f"Device: {device} | AMP: {use_amp}")
-    if args.split_json:
-        logging.info(f"Using explicit split file: {args.split_json}")
     logging.info(f"Hyperparameters: {vars(args)}")
 
     # --- Seed for reproducibility ---
@@ -468,8 +350,6 @@ def main(args):
         subset_order=args.subset_order,
         image_size=args.image_size,
         legacy_roots=args.legacy_root,
-        split_json=args.split_json,
-        augmented_slides=args.augmented_slides,
     )
     logging.info(f"Train batches: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
     if len(train_loader) == 0:
@@ -597,166 +477,129 @@ def main(args):
                 logging.info("Generator warmup complete; enabling adversarial training.")
 
             for _, (real_H, real_R, _) in enumerate(loop):
-                try:
-                    real_H = real_H.to(device, non_blocking=True)
-                    real_R = real_R.to(device, non_blocking=True)
+                real_H = real_H.to(device, non_blocking=True)
+                real_R = real_R.to(device, non_blocking=True)
 
-                    disc_loss_acc = 0.0
-                    gen_loss_acc = 0.0
+                disc_loss_acc = 0.0
+                gen_loss_acc = 0.0
 
-                    # --- Train Discriminators ---
-                    if not warmup_phase:
-                        for _ in range(args.d_steps):
-                            with torch.no_grad():
-                                fake_R = G_H2R(real_H)
-                                fake_H = G_R2H(real_R)
-
-                            fake_H_buffer = buffer_fake_H.push_and_pop(fake_H)
-                            fake_R_buffer = buffer_fake_R.push_and_pop(fake_R)
-
-                            with autocast_ctx():
-
-                                if args.instance_noise:
-                                    real_H_in = add_instance_noise(
-                                        real_H, global_d_step, noise_total_steps, args.instance_noise_sigma
-                                    )
-                                    real_R_in = add_instance_noise(
-                                        real_R, global_d_step, noise_total_steps, args.instance_noise_sigma
-                                    )
-                                    fake_H_in = add_instance_noise(
-                                        fake_H_buffer, global_d_step, noise_total_steps, args.instance_noise_sigma
-                                    )
-                                    fake_R_in = add_instance_noise(
-                                        fake_R_buffer, global_d_step, noise_total_steps, args.instance_noise_sigma
-                                    )
-                                else:
-                                    real_H_in = real_H
-                                    real_R_in = real_R
-                                    fake_H_in = fake_H_buffer
-                                    fake_R_in = fake_R_buffer
-
-                                D_H_real = D_H(real_H_in)
-                                D_H_fake = D_H(fake_H_in)
-                                D_H_loss = 0.5 * (
-                                    adv_loss(D_H_real, torch.ones_like(D_H_real))
-                                    + adv_loss(D_H_fake, torch.zeros_like(D_H_fake))
-                                )
-
-                                D_R_real = D_R(real_R_in)
-                                D_R_fake = D_R(fake_R_in)
-                                D_R_loss = 0.5 * (
-                                    adv_loss(D_R_real, torch.ones_like(D_R_real))
-                                    + adv_loss(D_R_fake, torch.zeros_like(D_R_fake))
-                                )
-
-                                loss_D = 0.5 * (D_H_loss + D_R_loss)
-
-                            opt_D.zero_grad()
-                            if use_amp:
-                                scaler_D.scale(loss_D).backward()
-                                scaler_D.step(opt_D)
-                                scaler_D.update()
-                            else:
-                                loss_D.backward()
-                                opt_D.step()
-
-                            disc_loss_acc += float(loss_D.detach().cpu())
-                            global_d_step += 1
-
-                    # --- Train Generators ---
-                    for _ in range(args.g_steps):
-                        for p in D_H.parameters():
-                            p.requires_grad_(False)
-                        for p in D_R.parameters():
-                            p.requires_grad_(False)
-                        with autocast_ctx():
+                # --- Train Discriminators ---
+                if not warmup_phase:
+                    for _ in range(args.d_steps):
+                        with torch.no_grad():
                             fake_R = G_H2R(real_H)
                             fake_H = G_R2H(real_R)
 
-                            cycled_H = G_R2H(fake_R)
-                            cycled_R = G_H2R(fake_H)
-                            loss_cycle = cycle_loss(real_H, cycled_H) + cycle_loss(real_R, cycled_R)
+                        fake_H_buffer = buffer_fake_H.push_and_pop(fake_H)
+                        fake_R_buffer = buffer_fake_R.push_and_pop(fake_R)
 
-                            loss_id = identity_loss(real_H, G_R2H(real_H)) + identity_loss(real_R, G_H2R(real_R))
+                        with autocast_ctx():
 
-                            if warmup_phase:
-                                loss_G = (
-                                    args.lambda_cycle * loss_cycle
-                                    + args.lambda_identity * loss_id
+                            if args.instance_noise:
+                                real_H_in = add_instance_noise(
+                                    real_H, global_d_step, noise_total_steps, args.instance_noise_sigma
+                                )
+                                real_R_in = add_instance_noise(
+                                    real_R, global_d_step, noise_total_steps, args.instance_noise_sigma
+                                )
+                                fake_H_in = add_instance_noise(
+                                    fake_H_buffer, global_d_step, noise_total_steps, args.instance_noise_sigma
+                                )
+                                fake_R_in = add_instance_noise(
+                                    fake_R_buffer, global_d_step, noise_total_steps, args.instance_noise_sigma
                                 )
                             else:
-                                pred_fake_H = D_H(fake_H)
-                                pred_fake_R = D_R(fake_R)
-                                loss_G_H_adv = adv_loss(pred_fake_H, torch.ones_like(pred_fake_H))
-                                loss_G_R_adv = adv_loss(pred_fake_R, torch.ones_like(pred_fake_R))
+                                real_H_in = real_H
+                                real_R_in = real_R
+                                fake_H_in = fake_H_buffer
+                                fake_R_in = fake_R_buffer
 
-                                loss_G = (
-                                    loss_G_H_adv
-                                    + loss_G_R_adv
-                                    + args.lambda_cycle * loss_cycle
-                                    + args.lambda_identity * loss_id
-                                )
+                            D_H_real = D_H(real_H_in)
+                            D_H_fake = D_H(fake_H_in)
+                            D_H_loss = 0.5 * (
+                                adv_loss(D_H_real, torch.ones_like(D_H_real))
+                                + adv_loss(D_H_fake, torch.zeros_like(D_H_fake))
+                            )
 
-                        opt_G.zero_grad()
+                            D_R_real = D_R(real_R_in)
+                            D_R_fake = D_R(fake_R_in)
+                            D_R_loss = 0.5 * (
+                                adv_loss(D_R_real, torch.ones_like(D_R_real))
+                                + adv_loss(D_R_fake, torch.zeros_like(D_R_fake))
+                            )
+
+                            loss_D = 0.5 * (D_H_loss + D_R_loss)
+
+                        opt_D.zero_grad()
                         if use_amp:
-                            scaler_G.scale(loss_G).backward()
-                            scaler_G.step(opt_G)
-                            scaler_G.update()
+                            scaler_D.scale(loss_D).backward()
+                            scaler_D.step(opt_D)
+                            scaler_D.update()
                         else:
-                            loss_G.backward()
-                            opt_G.step()
-                        for p in D_H.parameters():
-                            p.requires_grad_(True)
-                        for p in D_R.parameters():
-                            p.requires_grad_(True)
+                            loss_D.backward()
+                            opt_D.step()
 
-                        gen_loss_acc += float(loss_G.detach().cpu())
+                        disc_loss_acc += float(loss_D.detach().cpu())
+                        global_d_step += 1
 
-                    avg_d_loss = disc_loss_acc / max(1, args.d_steps)
-                    avg_g_loss = gen_loss_acc / max(1, args.g_steps)
+                # --- Train Generators ---
+                for _ in range(args.g_steps):
+                    for p in D_H.parameters():
+                        p.requires_grad_(False)
+                    for p in D_R.parameters():
+                        p.requires_grad_(False)
+                    with autocast_ctx():
+                        fake_R = G_H2R(real_H)
+                        fake_H = G_R2H(real_R)
 
-                    loop.set_postfix(G_loss=avg_g_loss, D_loss=avg_d_loss)
-                    running_G += avg_g_loss
-                    running_D += avg_d_loss
-                    batch_count += 1
-                    if profiler is not None:
-                        profiler.step()
+                        cycled_H = G_R2H(fake_R)
+                        cycled_R = G_H2R(fake_H)
+                        loss_cycle = cycle_loss(real_H, cycled_H) + cycle_loss(real_R, cycled_R)
 
-                    # If a stop was requested (SIGINT/SIGTERM), exit cleanly after the current batch.
-                    if stop_requested["flag"]:
-                        raise KeyboardInterrupt
+                        loss_id = identity_loss(real_H, G_R2H(real_H)) + identity_loss(real_R, G_H2R(real_R))
 
-                except KeyboardInterrupt:
-                    logging.warning("Stopping early due to interrupt; saving latest checkpoints and exiting.")
-                    _best_effort_cuda_cleanup(device)
-                    # Save a final checkpoint snapshot at the current epoch (best-effort)
-                    try:
-                        save_checkpoint(G_H2R, opt_G, scaler_G, run_ckpt_dir / f"G_H2R_epoch{epoch}.pth.tar")
-                        save_checkpoint(G_R2H, opt_G, scaler_G, run_ckpt_dir / f"G_R2H_epoch{epoch}.pth.tar")
-                        save_checkpoint(D_H,   opt_D, scaler_D, run_ckpt_dir / f"D_H_epoch{epoch}.pth.tar")
-                        save_checkpoint(D_R,   opt_D, scaler_D, run_ckpt_dir / f"D_R_epoch{epoch}.pth.tar")
-                    except Exception as _exc:
-                        logging.warning(f"Failed to save interrupt checkpoints: {_exc}")
-                    return
+                        if warmup_phase:
+                            loss_G = (
+                                args.lambda_cycle * loss_cycle
+                                + args.lambda_identity * loss_id
+                            )
+                        else:
+                            pred_fake_H = D_H(fake_H)
+                            pred_fake_R = D_R(fake_R)
+                            loss_G_H_adv = adv_loss(pred_fake_H, torch.ones_like(pred_fake_H))
+                            loss_G_R_adv = adv_loss(pred_fake_R, torch.ones_like(pred_fake_R))
 
-                except RuntimeError as exc:
-                    if device.type == "cuda" and _is_cuda_oom(exc):
-                        logging.error(
-                            "CUDA OOM in training loop. This run will stop cleanly to avoid a hard kill / stale context. "
-                            "Consider lowering batch size / image size / num_workers."
-                        )
-                        logging.error(f"OOM details: {exc}")
-                        _best_effort_cuda_cleanup(device)
-                        # Save a best-effort snapshot at the current epoch so you can resume.
-                        try:
-                            save_checkpoint(G_H2R, opt_G, scaler_G, run_ckpt_dir / f"G_H2R_epoch{epoch}.pth.tar")
-                            save_checkpoint(G_R2H, opt_G, scaler_G, run_ckpt_dir / f"G_R2H_epoch{epoch}.pth.tar")
-                            save_checkpoint(D_H,   opt_D, scaler_D, run_ckpt_dir / f"D_H_epoch{epoch}.pth.tar")
-                            save_checkpoint(D_R,   opt_D, scaler_D, run_ckpt_dir / f"D_R_epoch{epoch}.pth.tar")
-                        except Exception as _exc:
-                            logging.warning(f"Failed to save OOM snapshot checkpoints: {_exc}")
-                        return
-                    raise
+                            loss_G = (
+                                loss_G_H_adv
+                                + loss_G_R_adv
+                                + args.lambda_cycle * loss_cycle
+                                + args.lambda_identity * loss_id
+                            )
+
+                    opt_G.zero_grad()
+                    if use_amp:
+                        scaler_G.scale(loss_G).backward()
+                        scaler_G.step(opt_G)
+                        scaler_G.update()
+                    else:
+                        loss_G.backward()
+                        opt_G.step()
+                    for p in D_H.parameters():
+                        p.requires_grad_(True)
+                    for p in D_R.parameters():
+                        p.requires_grad_(True)
+
+                    gen_loss_acc += float(loss_G.detach().cpu())
+
+                avg_d_loss = disc_loss_acc / max(1, args.d_steps)
+                avg_g_loss = gen_loss_acc / max(1, args.g_steps)
+
+                loop.set_postfix(G_loss=avg_g_loss, D_loss=avg_d_loss)
+                running_G += avg_g_loss
+                running_D += avg_d_loss
+                batch_count += 1
+                if profiler is not None:
+                    profiler.step()
 
             history.append(
                 {
@@ -825,18 +668,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(PROJECT_ROOT / METADATA_CSV),
         help="Path to metadata.csv",
     )
-    parser.add_argument(
-        "--split-json",
-        type=str,
-        default=None,
-        help="Optional JSON with explicit train/val/test stain indices (e.g., augmented_splits.json).",
-    )
-    parser.add_argument(
-        "--augmented-slides",
-        type=str,
-        default=None,
-        help="Optional augmented_slides.json mapping indices to lab IDs (used with --split-json).",
-    )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=4, help="Ignored if --num-workers 0")
@@ -853,12 +684,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_IMAGE_SIZE,
         help="Target square size (pixels) for training patches.",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=str(DEFAULT_TRAIN_CONFIG),
-        help="Optional JSON file providing defaults for any CLI arguments.",
     )
 
     # Training
@@ -964,11 +789,6 @@ def build_parser() -> argparse.ArgumentParser:
     # Misc
     parser.add_argument("--legacy-root", action="append", default=[], help="Additional directories to resolve patch paths from.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--cudnn-benchmark",
-        action="store_true",
-        help="Enable cuDNN benchmark (may improve speed but can increase memory spikes).",
-    )
     return parser
 
 
@@ -978,13 +798,8 @@ def _resolve_path(path_str: str) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
-    config_path = _extract_config_path(argv)
-    config_values = _load_train_config(config_path)
-    _apply_config_defaults(parser, config_values)
     args = parser.parse_args(argv)
-    args.config = _resolve_path(args.config) if args.config else None
     args.metadata = _resolve_path(args.metadata)
-    args.split_json = _resolve_path(args.split_json) if args.split_json else None
     args.checkpoints_dir = _resolve_path(args.checkpoints_dir)
     args.logs_dir = _resolve_path(args.logs_dir)
     args.samples_dir = _resolve_path(args.samples_dir)

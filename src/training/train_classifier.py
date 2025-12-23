@@ -15,7 +15,7 @@ import logging
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -147,29 +147,94 @@ def train(args: argparse.Namespace) -> None:
     for idx, (_, label, _, _) in enumerate(full_dataset.entries):
         label_to_indices.setdefault(int(label), []).append(idx)
 
+    split_map: Optional[dict[str, str]] = None
+    if args.augmented_slides and args.augmented_splits:
+        split_map = load_split_map(Path(args.augmented_slides), Path(args.augmented_splits))
+        logging.info(
+            "Using augmented splits (%s, %s) with %d mapped slide IDs.",
+            args.augmented_slides,
+            args.augmented_splits,
+            len(split_map),
+        )
+
     train_indices: list[int] = []
     val_indices: list[int] = []
-    train_label_counts: Counter[int] = Counter()
-    val_label_counts: Counter[int] = Counter()
 
-    for label, idx_list in label_to_indices.items():
-        idx_array = np.array(idx_list, dtype=int)
-        rng.shuffle(idx_array)
-        count = len(idx_array)
-        desired_val = int(count * args.val_ratio)
-        if args.val_ratio > 0 and desired_val == 0 and count > 1:
-            desired_val = 1
-        if desired_val >= count:
-            desired_val = max(0, count - 1)
+    if split_map:
+        skipped_reasons: Dict[str, List[str]] = {
+            "test": [],
+            "missing_in_augmented_mapping": [],
+            "unknown_split": [],
+        }
 
-        val_split = idx_array[:desired_val].tolist() if desired_val > 0 else []
-        train_split = idx_array[desired_val:].tolist()
+        for idx, (slide_id, _, _, _) in enumerate(full_dataset.entries):
+            split = split_map.get(slide_id)
+            if split == "train":
+                train_indices.append(idx)
+            elif split == "val":
+                val_indices.append(idx)
+            elif split == "test":
+                skipped_reasons["test"].append(slide_id)
+            elif split is None:
+                skipped_reasons["missing_in_augmented_mapping"].append(slide_id)
+            else:
+                skipped_reasons["unknown_split"].append(slide_id)
 
-        val_indices.extend(val_split)
-        train_indices.extend(train_split)
+        skipped = sum(len(v) for v in skipped_reasons.values())
 
-        val_label_counts[label] += len(val_split)
-        train_label_counts[label] += len(train_split)
+        if not train_indices:
+            raise ValueError("Augmented split mapping produced an empty training set.")
+
+        logging.info(
+            "Augmented split counts | train=%d | val=%d | skipped=%d",
+            len(train_indices),
+            len(val_indices),
+            skipped,
+        )
+
+        for reason, slides in skipped_reasons.items():
+            if slides:
+                logging.info(
+                    "  skipped (%s): %d slides",
+                    reason,
+                    len(slides),
+                )
+
+        # write detailed skipped list
+        skipped_rows = []
+        for reason, slides in skipped_reasons.items():
+            for sid in slides:
+                skipped_rows.append({"slide_id": sid, "reason": reason})
+
+        if skipped_rows:
+            skipped_csv = PROJECT_ROOT / "outputs" / "analysis" / "train_classifier_skipped_slides.csv"
+            skipped_csv.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(skipped_rows).to_csv(skipped_csv, index=False)
+            logging.info("Wrote skipped slide details to %s", skipped_csv)
+
+        train_label_counts = Counter(int(full_dataset.entries[i][1]) for i in train_indices)
+        val_label_counts = Counter(int(full_dataset.entries[i][1]) for i in val_indices)
+    else:
+        train_label_counts: Counter[int] = Counter()
+        val_label_counts: Counter[int] = Counter()
+        for label, idx_list in label_to_indices.items():
+            idx_array = np.array(idx_list, dtype=int)
+            rng.shuffle(idx_array)
+            count = len(idx_array)
+            desired_val = int(count * args.val_ratio)
+            if args.val_ratio > 0 and desired_val == 0 and count > 1:
+                desired_val = 1
+            if desired_val >= count:
+                desired_val = max(0, count - 1)
+
+            val_split = idx_array[:desired_val].tolist() if desired_val > 0 else []
+            train_split = idx_array[desired_val:].tolist()
+
+            val_indices.extend(val_split)
+            train_indices.extend(train_split)
+
+            val_label_counts[label] += len(val_split)
+            train_label_counts[label] += len(train_split)
 
     if not train_indices:
         raise ValueError("Training split is empty after stratified sampling.")
@@ -208,6 +273,7 @@ def train(args: argparse.Namespace) -> None:
     best_val_loss = float("inf")
     best_epoch = 0
     best_state: Optional[dict[str, dict[str, torch.Tensor]]] = None
+    bad_epochs = 0
 
     checkpoints_dir = PROJECT_ROOT / "outputs" / "checkpoints" / "abmil"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -216,6 +282,20 @@ def train(args: argparse.Namespace) -> None:
     abmil_best_path = checkpoints_dir / f"{args.run_name}_abmil_best.pt"
     classifier_best_path = checkpoints_dir / f"{args.run_name}_classifier_best.pt"
 
+    def _attn_entropy_reg(attn_weights: list[torch.Tensor]) -> torch.Tensor:
+        """
+        Penalize overly peaky attention distributions.
+        Uses sum_i a_i * log(a_i) (<=0). Peaky -> 0, uniform -> negative.
+        Minimizing this encourages higher-entropy (less peaky) attention.
+        """
+        if not attn_weights:
+            return torch.tensor(0.0, device=args.device)
+        regs = []
+        for a in attn_weights:
+            a = a.to(args.device)
+            regs.append((a * torch.log(a.clamp_min(1e-8))).sum())
+        return torch.stack(regs).mean()
+    
     def run_epoch(loader: DataLoader, train: bool) -> Tuple[float, float, List[float], float, float]:
         if loader is None:
             return (
@@ -233,20 +313,26 @@ def train(args: argparse.Namespace) -> None:
             model.train()
         else:
             model.eval()
-        for _, labels, bags, _, _ in loader:
+        desc = "train" if train else "val"
+        pbar = tqdm(loader, desc=f"{desc} epoch", total=len(loader), leave=False)
+        for _, labels, bags, _, _ in pbar:
             labels = labels.to(args.device)
             bags = [bag.to(args.device) for bag in bags]
 
             if train:
                 optimizer.zero_grad()
-                logits, _, _ = model(bags)
+                logits, attn_weights, _ = model(bags)
                 loss = F.cross_entropy(logits, labels)
+                if args.attn_entropy_lambda and args.attn_entropy_lambda > 0:
+                    loss = loss + float(args.attn_entropy_lambda) * _attn_entropy_reg(attn_weights)
                 loss.backward()
                 optimizer.step()
             else:
                 with torch.no_grad():
-                    logits, _, _ = model(bags)
+                    logits, attn_weights, _ = model(bags)
                     loss = F.cross_entropy(logits, labels)
+                    if args.attn_entropy_lambda and args.attn_entropy_lambda > 0:
+                        loss = loss + float(args.attn_entropy_lambda) * _attn_entropy_reg(attn_weights)
 
             epoch_loss += loss.item() * labels.size(0)
             preds = logits.argmax(dim=1)
@@ -260,6 +346,12 @@ def train(args: argparse.Namespace) -> None:
 
         avg_loss = epoch_loss / total if total else float("nan")
         overall_acc = correct / total if total else float("nan")
+
+        # Update last tqdm postfix with final metrics
+        try:
+            pbar.set_postfix(loss=f"{avg_loss:.4f}", acc=f"{overall_acc:.3f}")
+        except Exception:
+            pass
 
         class_total = conf_matrix.sum(axis=1)
         class_correct = np.diag(conf_matrix)
@@ -349,13 +441,17 @@ def train(args: argparse.Namespace) -> None:
                     val_entry[f"accuracy_cls{cls_idx}"] = cls_acc
                 history.append(val_entry)
 
-                if val_loss < best_val_loss:
+                improved = val_loss < (best_val_loss - float(args.early_stop_min_delta or 0.0))
+                if improved:
                     best_val_loss = val_loss
                     best_epoch = epoch
                     best_state = {
                         "model": {k: v.cpu() for k, v in model.state_dict().items()},
                         "classifier": {k: v.cpu() for k, v in model.classifier.state_dict().items()},
                     }
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
 
             log_parts = [
                 f"Epoch {epoch:02d}",
@@ -396,6 +492,22 @@ def train(args: argparse.Namespace) -> None:
                 torch.save(model.state_dict(), epoch_abmil_path)
                 torch.save(model.classifier.state_dict(), epoch_classifier_path)
                 logging.info("Saved periodic checkpoints at epoch %d to %s and %s", epoch, epoch_abmil_path, epoch_classifier_path)
+
+            if (
+                val_loader
+                and args.early_stop_patience
+                and args.early_stop_patience > 0
+                and bad_epochs >= args.early_stop_patience
+            ):
+                logging.info(
+                    "Early stopping triggered at epoch %d (no val improvement for %d epochs). Best epoch=%d val_loss=%.4f",
+                    epoch,
+                    args.early_stop_patience,
+                    best_epoch,
+                    best_val_loss,
+                )
+                break
+   
     except KeyboardInterrupt:
         interrupted = True
         logging.warning("Training interrupted at epoch %d", epoch)
@@ -486,27 +598,101 @@ def train(args: argparse.Namespace) -> None:
         logging.info("Saved best classifier weights to %s", classifier_best_path)
 
 
+DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "train_classifier.json"
+
+
+def _load_json_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file {path} must contain a JSON object.")
+    return data
+
+
+def load_split_map(slides_path: Path, splits_path: Path) -> Dict[str, str]:
+    slides = json.loads(Path(slides_path).read_text("utf-8"))
+    splits = json.loads(Path(splits_path).read_text("utf-8"))
+    mapping: Dict[str, str] = {}
+
+    def _assign(indices: Sequence[int], split_name: str) -> None:
+        for idx in indices:
+            if 0 <= idx < len(slides):
+                entry = slides[idx]
+                slide_id = str(
+                    entry.get("ret_stain_id")
+                    or entry.get("he_stain_id")
+                    or entry.get("stain_id")
+                    or ""
+                ).strip()
+                if slide_id:
+                    mapping[slide_id] = split_name
+
+    _assign(splits.get("train_indices", []), "train")
+    _assign(splits.get("val_indices", []), "val")
+    _assign(splits.get("test_indices", []), "test")
+    return mapping
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train ABMIL classifier on precomputed embeddings.")
-    parser.add_argument("--embeddings-csv", type=str, required=True, help="CSV with at least patch_path and embedding_path columns.")
-    parser.add_argument("--metadata-csv", type=str, required=True, help="metadata.csv containing Reticulin grades.")
-    parser.add_argument("--output-dir", type=str, required=True, help="Directory to store outputs.")
-    parser.add_argument("--run-name", type=str, default="abmil", help="Identifier used for checkpoint filenames.")
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--att-dim", type=int, default=256)
-    parser.add_argument("--hidden-dim", type=int, default=512)
-    parser.add_argument("--dropout", type=float, default=0.25)
-    parser.add_argument("--num-classes", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=1, help="Bags per batch (defaults to 1).")
-    parser.add_argument("--device", type=str, default=None, help="Device to use (cuda, mps, cpu).")
-    parser.add_argument("--weight-file", type=str, default=None, help="Optional path to load classifier weights.")
-    parser.add_argument("--val-ratio", type=float, default=0.2, help="Fraction of slides for validation split.")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--log-level", type=str, default="INFO")
-    parser.add_argument("--save-every", type=int, default=5, help="Save model/classifier checkpoints every N epochs.")
-    return parser.parse_args(argv)
+    base = argparse.ArgumentParser(add_help=False)
+    base.add_argument("--config", type=str, default=str(DEFAULT_CONFIG))
+    config_ns, remaining = base.parse_known_args(argv)
+    config = _load_json_config(Path(config_ns.config))
+
+    parser = argparse.ArgumentParser(description="Train ABMIL classifier on precomputed embeddings.", parents=[base])
+    parser.add_argument("--embeddings-csv", type=str, default=config.get("embeddings_csv"))
+    parser.add_argument("--metadata-csv", type=str, default=config.get("metadata_csv"))
+    parser.add_argument("--output-dir", type=str, default=config.get("output_dir"))
+    parser.add_argument("--run-name", type=str, default=config.get("run_name", "abmil"))
+    parser.add_argument("--epochs", type=int, default=config.get("epochs", 30))
+    parser.add_argument("--lr", type=float, default=config.get("lr", 1e-4))
+    parser.add_argument("--weight-decay", type=float, default=config.get("weight_decay", 1e-4))
+    parser.add_argument("--att-dim", type=int, default=config.get("att_dim", 256))
+    parser.add_argument("--hidden-dim", type=int, default=config.get("hidden_dim", 512))
+    parser.add_argument("--dropout", type=float, default=config.get("dropout", 0.25))
+    parser.add_argument("--num-classes", type=int, default=config.get("num_classes", 4))
+    parser.add_argument("--batch-size", type=int, default=config.get("batch_size", 1), help="Bags per batch.")
+    parser.add_argument("--device", type=str, default=config.get("device"))
+    parser.add_argument("--weight-file", type=str, default=config.get("weight_file"))
+    parser.add_argument("--val-ratio", type=float, default=config.get("val_ratio", 0.2))
+    parser.add_argument("--seed", type=int, default=config.get("seed", 42))
+    parser.add_argument("--log-level", type=str, default=config.get("log_level", "INFO"))
+    parser.add_argument("--save-every", type=int, default=config.get("save_every", 5))
+    parser.add_argument("--augmented-slides", type=str, default=config.get("augmented_slides"))
+    parser.add_argument("--augmented-splits", type=str, default=config.get("augmented_splits"))
+    parser.add_argument(
+    "--attn-entropy-lambda",
+    type=float,
+    default=config.get("attn_entropy_lambda", 0.0),
+    help="Coefficient for attention entropy regularization (encourages less peaky attention).",
+    )
+    parser.add_argument(
+    "--early-stop-patience",
+    type=int,
+    default=config.get("early_stop_patience", 0),
+    help="Stop if val loss doesn't improve for this many epochs (0 disables).",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=config.get("early_stop_min_delta", 0.0),
+        help="Minimum val loss improvement to reset early-stopping patience.",
+    )
+
+    args = parser.parse_args(remaining)
+    if not args.embeddings_csv or not args.metadata_csv or not args.output_dir:
+        parser.error("Specify --embeddings-csv, --metadata-csv, and --output-dir (CLI or config).")
+    args.embeddings_csv = resolve_path(args.embeddings_csv)
+    args.metadata_csv = resolve_path(args.metadata_csv)
+    args.output_dir = resolve_path(args.output_dir, allow_missing=True)
+    if args.weight_file:
+        args.weight_file = resolve_path(args.weight_file)
+    if args.augmented_slides:
+        args.augmented_slides = resolve_path(args.augmented_slides)
+    if args.augmented_splits:
+        args.augmented_splits = resolve_path(args.augmented_splits)
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -530,8 +716,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             logging.FileHandler(log_file, mode="w"),
         ],
     )
+
+
+
     logging.info("Writing log to %s", log_file)
-    logging.info("Arguments: %s", json.dumps(vars(args), indent=2))
+    logging.info("Arguments: %s", json.dumps(vars(args), indent=2, default=str))
 
     train(args)
 
@@ -539,5 +728,3 @@ def main(argv: Sequence[str] | None = None) -> None:
 if __name__ == "__main__":
     main()
 
-# node1 has internet
-# node3  ssh and then load it there
