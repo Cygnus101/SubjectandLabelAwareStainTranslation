@@ -273,6 +273,7 @@ def train(args: argparse.Namespace) -> None:
     best_val_loss = float("inf")
     best_epoch = 0
     best_state: Optional[dict[str, dict[str, torch.Tensor]]] = None
+    bad_epochs = 0
 
     checkpoints_dir = PROJECT_ROOT / "outputs" / "checkpoints" / "abmil"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -281,6 +282,20 @@ def train(args: argparse.Namespace) -> None:
     abmil_best_path = checkpoints_dir / f"{args.run_name}_abmil_best.pt"
     classifier_best_path = checkpoints_dir / f"{args.run_name}_classifier_best.pt"
 
+    def _attn_entropy_reg(attn_weights: list[torch.Tensor]) -> torch.Tensor:
+        """
+        Penalize overly peaky attention distributions.
+        Uses sum_i a_i * log(a_i) (<=0). Peaky -> 0, uniform -> negative.
+        Minimizing this encourages higher-entropy (less peaky) attention.
+        """
+        if not attn_weights:
+            return torch.tensor(0.0, device=args.device)
+        regs = []
+        for a in attn_weights:
+            a = a.to(args.device)
+            regs.append((a * torch.log(a.clamp_min(1e-8))).sum())
+        return torch.stack(regs).mean()
+    
     def run_epoch(loader: DataLoader, train: bool) -> Tuple[float, float, List[float], float, float]:
         if loader is None:
             return (
@@ -298,20 +313,26 @@ def train(args: argparse.Namespace) -> None:
             model.train()
         else:
             model.eval()
-        for _, labels, bags, _, _ in loader:
+        desc = "train" if train else "val"
+        pbar = tqdm(loader, desc=f"{desc} epoch", total=len(loader), leave=False)
+        for _, labels, bags, _, _ in pbar:
             labels = labels.to(args.device)
             bags = [bag.to(args.device) for bag in bags]
 
             if train:
                 optimizer.zero_grad()
-                logits, _, _ = model(bags)
+                logits, attn_weights, _ = model(bags)
                 loss = F.cross_entropy(logits, labels)
+                if args.attn_entropy_lambda and args.attn_entropy_lambda > 0:
+                    loss = loss + float(args.attn_entropy_lambda) * _attn_entropy_reg(attn_weights)
                 loss.backward()
                 optimizer.step()
             else:
                 with torch.no_grad():
-                    logits, _, _ = model(bags)
+                    logits, attn_weights, _ = model(bags)
                     loss = F.cross_entropy(logits, labels)
+                    if args.attn_entropy_lambda and args.attn_entropy_lambda > 0:
+                        loss = loss + float(args.attn_entropy_lambda) * _attn_entropy_reg(attn_weights)
 
             epoch_loss += loss.item() * labels.size(0)
             preds = logits.argmax(dim=1)
@@ -325,6 +346,12 @@ def train(args: argparse.Namespace) -> None:
 
         avg_loss = epoch_loss / total if total else float("nan")
         overall_acc = correct / total if total else float("nan")
+
+        # Update last tqdm postfix with final metrics
+        try:
+            pbar.set_postfix(loss=f"{avg_loss:.4f}", acc=f"{overall_acc:.3f}")
+        except Exception:
+            pass
 
         class_total = conf_matrix.sum(axis=1)
         class_correct = np.diag(conf_matrix)
@@ -414,13 +441,17 @@ def train(args: argparse.Namespace) -> None:
                     val_entry[f"accuracy_cls{cls_idx}"] = cls_acc
                 history.append(val_entry)
 
-                if val_loss < best_val_loss:
+                improved = val_loss < (best_val_loss - float(args.early_stop_min_delta or 0.0))
+                if improved:
                     best_val_loss = val_loss
                     best_epoch = epoch
                     best_state = {
                         "model": {k: v.cpu() for k, v in model.state_dict().items()},
                         "classifier": {k: v.cpu() for k, v in model.classifier.state_dict().items()},
                     }
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
 
             log_parts = [
                 f"Epoch {epoch:02d}",
@@ -461,6 +492,22 @@ def train(args: argparse.Namespace) -> None:
                 torch.save(model.state_dict(), epoch_abmil_path)
                 torch.save(model.classifier.state_dict(), epoch_classifier_path)
                 logging.info("Saved periodic checkpoints at epoch %d to %s and %s", epoch, epoch_abmil_path, epoch_classifier_path)
+
+            if (
+                val_loader
+                and args.early_stop_patience
+                and args.early_stop_patience > 0
+                and bad_epochs >= args.early_stop_patience
+            ):
+                logging.info(
+                    "Early stopping triggered at epoch %d (no val improvement for %d epochs). Best epoch=%d val_loss=%.4f",
+                    epoch,
+                    args.early_stop_patience,
+                    best_epoch,
+                    best_val_loss,
+                )
+                break
+   
     except KeyboardInterrupt:
         interrupted = True
         logging.warning("Training interrupted at epoch %d", epoch)
@@ -614,6 +661,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=config.get("save_every", 5))
     parser.add_argument("--augmented-slides", type=str, default=config.get("augmented_slides"))
     parser.add_argument("--augmented-splits", type=str, default=config.get("augmented_splits"))
+    parser.add_argument(
+    "--attn-entropy-lambda",
+    type=float,
+    default=config.get("attn_entropy_lambda", 0.0),
+    help="Coefficient for attention entropy regularization (encourages less peaky attention).",
+    )
+    parser.add_argument(
+    "--early-stop-patience",
+    type=int,
+    default=config.get("early_stop_patience", 0),
+    help="Stop if val loss doesn't improve for this many epochs (0 disables).",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=config.get("early_stop_min_delta", 0.0),
+        help="Minimum val loss improvement to reset early-stopping patience.",
+    )
+
     args = parser.parse_args(remaining)
     if not args.embeddings_csv or not args.metadata_csv or not args.output_dir:
         parser.error("Specify --embeddings-csv, --metadata-csv, and --output-dir (CLI or config).")
@@ -650,6 +716,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             logging.FileHandler(log_file, mode="w"),
         ],
     )
+
+
+
     logging.info("Writing log to %s", log_file)
     logging.info("Arguments: %s", json.dumps(vars(args), indent=2, default=str))
 

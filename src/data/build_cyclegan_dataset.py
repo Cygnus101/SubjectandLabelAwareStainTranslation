@@ -45,7 +45,7 @@ DEFAULT_AUGMENTED_SPLITS = resolve_project_path("augmented_splits.json", allow_m
 METADATA_CSV = "metadata.csv"                  # metadata file
 LOG_FILE = resolve_project_path("outputs/logs/dataloader_skips.log", allow_missing=True)  # where to log failures
 
-BATCH_SIZE = 64
+BATCH_SIZE = 16
 NUM_WORKERS = 16
 PREFETCH_FACTOR = 4
 PIN_MEMORY = True
@@ -118,6 +118,7 @@ _DEFAULT_LAB_EXCLUSIONS = tuple(
 )
 
 # ---------- transforms ----------
+
 def ensure_size(img: Image.Image, target: int) -> Image.Image:
     """Guarantee image is exactly target x target (crop+pad if needed)."""
     if img.size == (target, target):
@@ -132,16 +133,27 @@ def ensure_size(img: Image.Image, target: int) -> Image.Image:
         img = img.resize((target, target), Image.BILINEAR)
     return img
 
+# --- Picklable wrapper for ensure_size for PyTorch DataLoader multiprocessing ---
+class EnsureSizeTransform:
+    """Picklable callable wrapper for ensure_size().
+
+    Needed because DataLoader multiprocessing (spawn) on macOS requires transforms
+    to be picklable; local functions inside build_transforms are not.
+    """
+
+    def __init__(self, target: int):
+        self.target = int(target)
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        return ensure_size(img, self.target)
+
 def random_quadrant_rotation(img: Image.Image) -> Image.Image:
     """Rotate by 0, 90, 180, or 270 degrees randomly."""
     return img.rotate(random.choice((0, 90, 180, 270)))
 
 def build_transforms(image_size: int) -> Tuple[T.Compose, T.Compose]:
-    def _ensure(img: Image.Image) -> Image.Image:
-        return ensure_size(img, image_size)
-
     train_tf = T.Compose([
-        T.Lambda(_ensure),
+        EnsureSizeTransform(image_size),
         T.RandomHorizontalFlip(0.5),
         T.RandomVerticalFlip(0.5),
         T.Lambda(random_quadrant_rotation),
@@ -150,7 +162,7 @@ def build_transforms(image_size: int) -> Tuple[T.Compose, T.Compose]:
     ])
 
     eval_tf = T.Compose([
-        T.Lambda(_ensure),
+        EnsureSizeTransform(image_size),
         T.ToTensor(),
         T.Normalize((0.5,) * 3, (0.5,) * 3),
     ])
@@ -206,7 +218,11 @@ def _split_by_group(paths: List[str], groups: List[str],
     return split
 
 
-def _load_explicit_lab_splits(split_path: str, lab_ids: Sequence[str]) -> Dict[str, Set[str]]:
+def _load_explicit_lab_splits(
+    split_path: str,
+    lab_ids: Sequence[str],
+    slides_json: Optional[str] = None,
+) -> Dict[str, Set[str]]:
     with Path(split_path).expanduser().resolve(strict=False).open("r", encoding="utf-8") as fp:
         payload = json.load(fp)
     if not isinstance(payload, dict):
@@ -222,9 +238,23 @@ def _load_explicit_lab_splits(split_path: str, lab_ids: Sequence[str]) -> Dict[s
     if not sorted_ids:
         raise RuntimeError("Cannot build explicit splits because no stain IDs were found in metadata.")
 
+    slides_data: Optional[list] = None
+    if slides_json:
+        slides_path = Path(slides_json).expanduser().resolve(strict=False)
+        if slides_path.exists():
+            try:
+                slides_data = json.loads(slides_path.read_text("utf-8"))
+            except Exception as exc:
+                logger.warning("Failed to read augmented slides from %s (%s); falling back to metadata order.", slides_path, exc)
+
     def _map_to_ids(idxs: List[int], split_name: str) -> Set[str]:
         result: Set[str] = set()
         for idx in idxs:
+            if slides_data and 0 <= idx < len(slides_data):
+                lab = str(slides_data[idx].get("lab_id", "")).strip()
+                if lab:
+                    result.add(lab)
+                    continue
             if idx < 0 or idx >= len(sorted_ids):
                 logger.warning(
                     "Split %s references stain index %d outside range [0, %d); skipping.",
@@ -327,16 +357,28 @@ class HEToReticulinFromMetadata(Dataset):
         raise RuntimeError("Too many retries, dataset may contain many bad files.")
 
 # ---------- reporting wrapper ----------
+class EmptyCycleGANDataset(Dataset):
+    """Minimal dataset placeholder for empty splits."""
+    def __init__(self):
+        self.failed_count = 0
+
+    def __len__(self) -> int:
+        return 0
+
+    def __getitem__(self, index: int):
+        raise IndexError("EmptyCycleGANDataset contains no items.")
+
+
 class ReportingDataLoader:
     """Wraps DataLoader to report failures per epoch."""
-    def __init__(self, dataloader: DataLoader, dataset: HEToReticulinFromMetadata):
+    def __init__(self, dataloader: DataLoader, dataset: Optional[HEToReticulinFromMetadata]):
         self.dataloader = dataloader
         self.dataset = dataset
 
     def __iter__(self):
         for batch in self.dataloader:
             yield batch
-        if self.dataset.failed_count > 0:
+        if self.dataset and self.dataset.failed_count > 0:
             logger.info(f"[EPOCH SUMMARY] {self.dataset.failed_count} files were skipped this epoch.")
             self.dataset.failed_count = 0
 
@@ -389,7 +431,7 @@ def make_loaders_from_metadata(
 
     explicit_lab_splits: Optional[Dict[str, Set[str]]] = None
     if split_json:
-        explicit_lab_splits = _load_explicit_lab_splits(split_json, df["lab_norm"].tolist())
+        explicit_lab_splits = _load_explicit_lab_splits(split_json, df["lab_norm"].tolist(), slides_json=augmented_slides)
         logger.info(
             "Using explicit split file %s | train=%d | val=%d | test=%d lab IDs",
             split_json,
@@ -456,7 +498,9 @@ def make_loaders_from_metadata(
             logger.warning("Subset requested but lab column %s is empty.", lab_col)
 
     if exclude_labs is None or (isinstance(exclude_labs, Sequence) and len(exclude_labs) == 0):
-        exclude_labs = _DEFAULT_LAB_EXCLUSIONS
+        # When using explicit splits we should not also drop labs via config defaults,
+        # otherwise the requested subset can disappear entirely.
+        exclude_labs = () if explicit_lab_splits is not None else _DEFAULT_LAB_EXCLUSIONS
     normalized_exclude = _normalize_lab_list(exclude_labs)
     if normalized_exclude:
         if lab_col is None:
@@ -509,6 +553,11 @@ def make_loaders_from_metadata(
     if explicit_lab_splits is not None:
         he_split = _split_paths_by_lab(he_paths, he_lab_lookup, explicit_lab_splits)
         ret_split = _split_paths_by_lab(ret_paths, ret_lab_lookup, explicit_lab_splits)
+        logger.info(
+            "Explicit split patch counts | H&E train/val/test = %s | Reticulin train/val/test = %s",
+            {k: len(v) for k, v in he_split.items()},
+            {k: len(v) for k, v in ret_split.items()},
+        )
     else:
         he_split  = _split_by_group(he_paths,  he_groups,  train_ratio, val_ratio, seed)
         ret_split = _split_by_group(ret_paths, ret_groups, train_ratio, val_ratio, seed)
@@ -516,9 +565,32 @@ def make_loaders_from_metadata(
     train_tf, eval_tf = build_transforms(image_size)
 
     def _mk(split: str, train: bool):
+        he_files = he_split.get(split, [])
+        ret_files = ret_split.get(split, [])
+        if not he_files or not ret_files:
+            logger.warning(
+                "Split %s has insufficient data (H&E=%d | Reticulin=%d); returning empty loader.",
+                split,
+                len(he_files),
+                len(ret_files),
+            )
+            empty_dataset = EmptyCycleGANDataset()
+            empty_loader = DataLoader(
+                empty_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=0,
+            )
+            return ReportingDataLoader(empty_loader, empty_dataset)
+        logger.info(
+            "Creating %s split | H&E patches: %d | Reticulin patches: %d",
+            split,
+            len(he_files),
+            len(ret_files),
+        )
         ds = HEToReticulinFromMetadata(
-            he_files=he_split[split],
-            ret_files=ret_split[split],
+            he_files=he_files,
+            ret_files=ret_files,
             pairing=pairing,
             he_transform=train_tf if train else eval_tf,
             ret_transform=train_tf if train else eval_tf,

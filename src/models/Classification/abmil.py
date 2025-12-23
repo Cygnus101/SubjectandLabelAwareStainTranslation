@@ -40,12 +40,13 @@ class GatedAttentionPool(nn.Module):
 class SlideClassifier(nn.Module):
     """Simple MLP classifier operating on aggregated slide embeddings."""
 
-    def __init__(self, in_dim: int, hidden_dim: int, num_classes: int, dropout: float = 0.25) -> None:
+    def __init__(self, in_dim: int, hidden_dim: int, num_classes: int, dropout: float = 0.5) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, num_classes),
         )
 

@@ -158,6 +158,16 @@ def run(args: argparse.Namespace) -> None:
     logging.info("Embeddings will be saved to %s", output_root)
 
     df = pd.read_csv(metadata_path)
+    if args.split_json:
+        split_path = resolve_path(args.split_json)
+        slides_json = resolve_path(args.augmented_slides)
+        allowed = _load_allowed_labs(split_path, slides_json)
+        lab_col = _detect_lab_column(df)
+        if lab_col is None:
+            raise ValueError("metadata CSV missing lab column required for split filtering.")
+        before = len(df)
+        df = df[df[lab_col].astype(str).str.strip().isin(allowed)].reset_index(drop=True)
+        logging.info("Filtered by split JSON %s → %d/%d rows remain", split_path, len(df), before)
     if args.filter_types:
         allowed = {t.lower() for t in args.filter_types}
         df = df[df["type"].str.lower().isin(allowed)]
@@ -258,6 +268,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--metadata", type=str, default=str(PROJECT_ROOT / "metadata.csv"))
     parser.add_argument("--root", type=str, default=None, help="Primary root directory for relative patch paths.")
     parser.add_argument("--legacy-root", action="append", default=[], help="Additional roots to search for patches.")
+    parser.add_argument("--split-json", type=str, default=None, help="Optional split JSON to restrict stain IDs.")
+    parser.add_argument("--augmented-slides", type=str, default=str(PROJECT_ROOT / "augmented_slides.json"), help="Slides JSON used to map split indices to lab IDs.")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to SimCLR checkpoint (.pt).")
 
     # Model params
