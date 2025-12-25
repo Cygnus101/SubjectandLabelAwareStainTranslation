@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-Evaluate CycleGAN generators by computing FID on explicit train/val/test stain-id splits.
+Evaluate CycleGAN generators by computing FID on explicit train/val/test splits sourced from augmented_splits.json.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 from typing import Dict, Sequence
@@ -22,16 +23,27 @@ from utils.path import resolve_path
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-def _load_split_lists(csv_path: Path, split_col: str) -> Dict[str, list[str]]:
-    df = pd.read_csv(csv_path)
-    if "stain_id" not in df.columns:
-        raise ValueError(f"{csv_path} must contain a 'stain_id' column.")
-    if split_col not in df.columns:
-        raise ValueError(f"{csv_path} missing required column '{split_col}'.")
+def _load_split_lists(splits_path: Path, slides_path: Path) -> Dict[str, list[str]]:
+    splits_payload = json.loads(splits_path.read_text("utf-8"))
+    if not isinstance(splits_payload, dict):
+        raise ValueError(f"{splits_path} must contain a JSON object (augmented_splits format).")
+    slides_payload = json.loads(slides_path.read_text("utf-8"))
+    if not isinstance(slides_payload, list):
+        raise ValueError(f"{slides_path} must contain a JSON list (augmented_slides format).")
+
+    def _stain_id(idx: int) -> str:
+        entry = slides_payload[idx]
+        return str(entry.get("ret_stain_id") or entry.get("he_stain_id") or f"idx_{idx}")
+
     result: Dict[str, list[str]] = {"train": [], "val": [], "test": []}
     for split in result.keys():
-        mask = df[split_col].astype(str).str.lower() == split
-        result[split] = df.loc[mask, "stain_id"].astype(str).tolist()
+        key = f"{split}_indices"
+        for idx in splits_payload.get(key, []):
+            if isinstance(idx, int) and 0 <= idx < len(slides_payload):
+                result[split].append(_stain_id(idx))
+
+    if not any(result.values()):
+        raise RuntimeError(f"No split indices found in {splits_path}.")
     return result
 
 
@@ -109,7 +121,7 @@ def _compute_split_fid(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate FID per stain splits for CycleGAN generators.")
+    parser = argparse.ArgumentParser(description="Evaluate FID per splits defined in augmented_splits.json.")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to a single CycleGAN H2R checkpoint.")
     parser.add_argument(
         "--checkpoint-root",
@@ -118,8 +130,8 @@ def parse_args() -> argparse.Namespace:
         help="Directory to recursively search for G_H2R checkpoints.",
     )
     parser.add_argument("--metadata", type=Path, default=base.DEFAULT_METADATA)
-    parser.add_argument("--split-csv", type=Path, required=True, help="CSV with columns stain_id and split.")
-    parser.add_argument("--split-col", type=str, default="split", help="Column that specifies split name.")
+    parser.add_argument("--augmented-splits", type=Path, default=Path("augmented_splits.json"))
+    parser.add_argument("--augmented-slides", type=Path, default=Path("augmented_slides.json"))
     parser.add_argument("--output-dir", type=Path, default=base.DEFAULT_OUTPUT_DIR / "splits")
     parser.add_argument("--patch-size", type=int, default=512)
     parser.add_argument("--device", type=str, default=base._default_device())
@@ -139,7 +151,7 @@ def main() -> None:
     if missing:
         raise ValueError(f"metadata missing required columns: {sorted(missing)}")
 
-    split_map = _load_split_lists(resolve_path(args.split_csv), args.split_col)
+    split_map = _load_split_lists(resolve_path(args.augmented_splits), resolve_path(args.augmented_slides))
     if not any(split_map.values()):
         raise RuntimeError("No stain IDs found in the provided split CSV.")
 
