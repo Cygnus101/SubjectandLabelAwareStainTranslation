@@ -2,7 +2,7 @@
 """Train Augmented CycleGAN with slide-level classification + contrastive losses."""
 
 from __future__ import annotations
-
+import os
 import argparse
 import json
 import logging
@@ -62,26 +62,26 @@ from models.Feature_Extractor import MODEL_REGISTRY as ENCODER_REGISTRY  # type:
 from models.Classification.abmil import ABMIL, SlideClassifier  # noqa: E402
 
 
+# @dataclass
+# class SlideRecord:
+#     lab_id: str
+#     he_stain_id: str
+#     ret_stain_id: str
+#     grade: int
+#     he_paths: list[Path]
+#     ret_paths: list[Path]
+
+#     @property
+#     def slide_id(self) -> str:
+#         return f"{self.lab_id}|{self.he_stain_id}|{self.ret_stain_id}"
+
+#     @property
+#     def contrastive_id(self) -> str:
+#         return _contrastive_group_id(self.lab_id)
+
+
 @dataclass
-class SlideRecord:
-    lab_id: str
-    he_stain_id: str
-    ret_stain_id: str
-    grade: int
-    he_paths: list[Path]
-    ret_paths: list[Path]
-
-    @property
-    def slide_id(self) -> str:
-        return f"{self.lab_id}|{self.he_stain_id}|{self.ret_stain_id}"
-
-    @property
-    def contrastive_id(self) -> str:
-        return _contrastive_group_id(self.lab_id)
-
-
-@dataclass
-class AugmentedSlide:
+class Slide:
     lab_id: str
     he_stain_id: str
     ret_stain_id: str
@@ -145,18 +145,18 @@ def _resolve_patch_path(raw: str, data_root: Optional[Path]) -> Path:
     base = Path(data_root) if data_root else PROJECT_ROOT
     return (base / path).resolve()
 
-def load_augmented_slides_filtered(slides_path, data_root, required_indices):
+def remap_load_slides(slides_path, data_root, required_indices):
     payload = json.loads(Path(slides_path).read_text("utf-8"))
     if not isinstance(payload, list):
         raise ValueError("Slides JSON must contain a list.")
 
-    filtered_slides = []
+    slides = []
     index_map = {}   # old_index → new_index
 
     for new_idx, old_idx in enumerate(required_indices):
         entry = payload[old_idx]
 
-        lab_id = str(entry["lab_id"])
+        lab_id = str(entry["lab_id"]) 
         he_id  = str(entry["he_stain_id"])
         ret_id = str(entry["ret_stain_id"])
         grade  = int(entry["grade"])
@@ -175,8 +175,8 @@ def load_augmented_slides_filtered(slides_path, data_root, required_indices):
         if not he_paths or not ret_paths:
             continue
 
-        filtered_slides.append(
-            AugmentedSlide(
+        slides.append(
+            Slide(
                 lab_id=lab_id,
                 he_stain_id=he_id,
                 ret_stain_id=ret_id,
@@ -188,66 +188,14 @@ def load_augmented_slides_filtered(slides_path, data_root, required_indices):
             )
         )
 
-        index_map[old_idx] = len(filtered_slides) - 1
+        index_map[old_idx] = len(slides) - 1
 
     LOGGER.info("Loaded %d filtered slides (from %d total)",
-                len(filtered_slides), len(payload))
+                len(slides), len(payload))
 
-    return filtered_slides, index_map
+    return slides, index_map
 
-
-def load_augmented_slides(slides_path: Path, data_root: Optional[Path]) -> list[AugmentedSlide]:
-    payload = json.loads(Path(slides_path).read_text("utf-8"))
-    if not isinstance(payload, list):
-        raise ValueError(f"Serialized slides file {slides_path} must contain a list.")
-    slides: list[AugmentedSlide] = []
-    for entry in payload:
-        try:
-            lab_id = str(entry["lab_id"])
-            he_id = str(entry["he_stain_id"])
-            ret_id = str(entry["ret_stain_id"])
-            grade = int(entry["grade"])
-            he_meta = entry.get("he_patches", [])
-            ret_meta = entry.get("ret_patches", [])
-        except KeyError as exc:
-            raise ValueError(f"Slide entry missing required field: {exc}") from exc
-        he_paths: list[Path] = []
-        he_flags: list[int] = []
-        for patch in he_meta:
-            he_paths.append(_resolve_patch_path(patch["patch_path"], data_root))
-            he_flags.append(int(patch.get("is_top10", 0)))
-        ret_paths: list[Path] = []
-        ret_flags: list[int] = []
-        for patch in ret_meta:
-            ret_paths.append(_resolve_patch_path(patch["patch_path"], data_root))
-            ret_flags.append(int(patch.get("is_top10", 0)))
-        if len(he_flags) < len(he_paths):
-            he_flags.extend([0] * (len(he_paths) - len(he_flags)))
-        if len(ret_flags) < len(ret_paths):
-            ret_flags.extend([0] * (len(ret_paths) - len(ret_flags)))
-        he_flags = he_flags[: len(he_paths)]
-        ret_flags = ret_flags[: len(ret_paths)]
-        if not he_paths or not ret_paths:
-            continue
-        slides.append(
-            AugmentedSlide(
-                lab_id=lab_id,
-                he_stain_id=he_id,
-                ret_stain_id=ret_id,
-                grade=grade,
-                he_paths=he_paths,
-                he_top_flags=he_flags,
-                ret_paths=ret_paths,
-                ret_top_flags=ret_flags,
-            )
-        )
-    if not slides:
-        raise RuntimeError(f"No slides loaded from {slides_path}")
-    LOGGER.info("Loaded %d serialized slide(s) from %s", len(slides), slides_path)
-    return slides
-
-
-def load_augmented_splits(split_path: Path) -> dict[str, list[int]]:
+def load_splits(split_path: Path) -> dict[str, list[int]]:
     payload = json.loads(Path(split_path).read_text("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Split file {split_path} must contain a mapping.")
@@ -286,277 +234,277 @@ def _build_patch_transform(image_size: int, augment: bool) -> T.Compose:
     return T.Compose(ops)
 
 
-class SlidePatchDataset(Dataset):
+# class SlidePatchDataset(Dataset):
     """Dataset returning N patch stacks per slide for both stains."""
 
+    # def __init__(
+    #     self,
+    #     metadata_csv: Path,
+    #     data_root: Optional[Path],
+    #     patches_per_slide: int,
+    #     image_size: int,
+    #     augment: bool,
+    #     seed: int,
+    #     max_slides: Optional[int] = None,
+    #     patch_retries: int = 8,
+    #     subset_pct: Optional[float] = None,
+    #     subset_order: str = "random",
+    #     legacy_roots: Optional[Sequence[Path]] = None,
+    #     entries: Optional[list[SlideRecord]] = None,
+    # ) -> None:
+    #     self.metadata_path = resolve_path(metadata_csv)
+    #     self.patch_root = resolve_path(data_root or self.metadata_path.parent)
+    #     self.patches_per_slide = patches_per_slide
+    #     self.train_transform = _build_patch_transform(image_size, augment)
+    #     self.eval_transform = _build_patch_transform(image_size, augment=False)
+    #     self.patch_retries = max(1, patch_retries)
+    #     self.rng = random.Random(seed)
+    #     self.subset_pct = subset_pct
+    #     self.subset_order = subset_order
+    #     self.legacy_roots: list[Path] = []
+    #     for root in legacy_roots or []:
+    #         try:
+    #             resolved = Path(root).expanduser().resolve()
+    #         except FileNotFoundError:
+    #             resolved = Path(root).expanduser()
+    #         self.legacy_roots.append(resolved)
+    #     self.missing_patch_paths = 0
+    #     self._missing_log_limit = 20
+    #     if entries is not None:
+    #         self.entries = entries
+    #     else:
+    #         self.entries = self._build_entries(max_slides)
+    #     if not self.entries:
+    #         raise RuntimeError("No slides with both H&E and Reticulin patches were found.")
+    #     if self.missing_patch_paths:
+    #         LOGGER.warning("Skipped %d patch files that were missing on disk.", self.missing_patch_paths)
+
+    # def _normalize_path(self, raw: str) -> Path:
+    #     normalized = raw.replace("\\", "/")
+    #     path = Path(normalized)
+
+    #     # If it's an absolute path, try to remap from any legacy root to the current project layout.
+    #     if path.is_absolute():
+    #         if path.exists():
+    #             return path
+    #         for legacy_root in self.legacy_roots:
+    #             try:
+    #                 relative = path.relative_to(legacy_root)
+    #             except ValueError:
+    #                 continue
+    #             remapped = (self.patch_root / relative).resolve()
+    #             if remapped.exists():
+    #                 return remapped
+    #         # No remap possible or remapped target missing; return original path.
+    #         return path
+
+    #     candidate = (self.patch_root / path).resolve()
+    #     if candidate.exists():
+    #         return candidate
+    #     for legacy_root in self.legacy_roots:
+    #         alt = (legacy_root / path).resolve()
+    #         if alt.exists():
+    #             return alt
+    #     return candidate
+
+    # def _collect_valid_paths(self, raw_paths: Sequence[str]) -> list[Path]:
+    #     paths: list[Path] = []
+    #     for raw in raw_paths:
+    #         path = self._normalize_path(str(raw))
+    #         if not path.is_file():
+    #             self.missing_patch_paths += 1
+    #             if self.missing_patch_paths <= self._missing_log_limit:
+    #                 LOGGER.warning("Patch file not found: %s", path)
+    #             elif self.missing_patch_paths == self._missing_log_limit + 1:
+    #                 LOGGER.warning("Too many missing patch files; suppressing additional warnings.")
+    #             continue
+    #         paths.append(path)
+    #     return paths
+
+    # def _build_entries(self, max_slides: Optional[int]) -> list[SlideRecord]:
+    #     df = pd.read_csv(self.metadata_path)
+    #     required = {"Lab No.", "stain_id", "type", "patch_path", "Reticulin Grade"}
+    #     if required - set(df.columns):
+    #         missing = required - set(df.columns)
+    #         raise ValueError(f"metadata missing required columns: {sorted(missing)}")
+
+    #     df["type_norm"] = df["type"].astype(str).str.lower()
+    #     df["patch_path_norm"] = df["patch_path"].astype(str)
+    #     df["lab_id"] = df["Lab No."].astype(str).str.strip()
+    #     df = df[df["lab_id"].astype(bool)]
+    #     if self.subset_pct is not None:
+    #         pct = max(0.0, min(100.0, float(self.subset_pct)))
+    #         unique_labs = df["lab_id"].unique().tolist()
+    #         target = max(1, int(round(len(unique_labs) * (pct / 100.0))))
+    #         if target < len(unique_labs):
+    #             if self.subset_order == "ascending":
+    #                 labs_sorted = sorted(unique_labs)
+    #                 selected = labs_sorted[:target]
+    #             elif self.subset_order == "descending":
+    #                 labs_sorted = sorted(unique_labs, reverse=True)
+    #                 selected = labs_sorted[:target]
+    #             else:
+    #                 selected = self.rng.sample(unique_labs, target)
+    #             df = df[df["lab_id"].isin(selected)]
+    #         LOGGER.info(
+    #             "Subset active (%s): %.2f%% of labs -> %d labs",
+    #             self.subset_order,
+    #             pct,
+    #             df["lab_id"].nunique(),
+    #         )
+    #     entries: list[SlideRecord] = []
+    #     for lab_id, lab_df in df.groupby("lab_id"):
+    #         he_df = lab_df[lab_df["type_norm"].str.contains("h&e", na=False)]
+    #         ret_df = lab_df[lab_df["type_norm"].str.contains("reticulin", na=False)]
+    #         if he_df.empty or ret_df.empty:
+    #             continue
+
+    #         he_groups = {str(sid): group for sid, group in he_df.groupby("stain_id")}
+    #         ret_groups = {str(sid): group for sid, group in ret_df.groupby("stain_id")}
+    #         ret_ids = list(ret_groups.keys())
+
+    #         for he_id, he_group in he_groups.items():
+    #             ret_id = _closest_stain_id(he_id, ret_ids)
+    #             if ret_id is None:
+    #                 continue
+    #             ret_group = ret_groups[ret_id]
+    #             grade_value = _parse_grade(ret_group["Reticulin Grade"].iloc[0])
+    #             if grade_value is None:
+    #                 continue
+
+    #             he_paths = self._collect_valid_paths(he_group["patch_path_norm"].tolist())
+    #             ret_paths = self._collect_valid_paths(ret_group["patch_path_norm"].tolist())
+    #             if not he_paths or not ret_paths:
+    #                 continue
+
+    #             entries.append(
+    #                 SlideRecord(
+    #                     lab_id=str(lab_id),
+    #                     he_stain_id=he_id,
+    #                     ret_stain_id=ret_id,
+    #                     grade=grade_value,
+    #                     he_paths=he_paths,
+    #                     ret_paths=ret_paths,
+    #                 )
+    #             )
+    #             if max_slides is not None and len(entries) >= max_slides:
+    #                 return entries
+    #     return entries
+
+    # def __len__(self) -> int:
+    #     return len(self.entries)
+
+    # def _load_stack(self, paths: list[Path], transform: Optional[T.Compose] = None) -> torch.Tensor:
+    #     images: list[torch.Tensor] = []
+    #     pool = list(paths)
+    #     if not pool:
+    #         raise RuntimeError("Slide has no available patches.")
+    #     indices: list[int]
+    #     if len(pool) >= self.patches_per_slide:
+    #         indices = self.rng.sample(range(len(pool)), self.patches_per_slide)
+    #     else:
+    #         indices = [self.rng.randrange(len(pool)) for _ in range(self.patches_per_slide)]
+    #     attempts = 0
+    #     max_attempts = self.patch_retries * self.patches_per_slide
+    #     ptr = 0
+    #     while len(images) < self.patches_per_slide and attempts < max_attempts:
+    #         path = pool[indices[ptr % len(indices)]]
+    #         ptr += 1
+    #         attempts += 1
+    #         try:
+    #             with Image.open(path) as img:
+    #                 tfm = transform or self.train_transform
+    #                 tensor = tfm(img.convert("RGB"))
+    #         except (FileNotFoundError, UnidentifiedImageError, OSError) as exc:
+    #             LOGGER.warning("Failed to load patch %s (%s)", path, exc)
+    #             continue
+    #         images.append(tensor)
+    #     if len(images) < self.patches_per_slide:
+    #         raise RuntimeError(f"Unable to collect {self.patches_per_slide} patches from {paths[0].parent}")
+    #     return torch.stack(images, dim=0)
+
+    # def get_slide(
+    #     self,
+    #     idx: int,
+    #     *,
+    #     deterministic: bool = False,
+    # ):
+    #     record = self.entries[idx]
+    #     tfm = self.eval_transform if deterministic else self.train_transform
+    #     he_stack = self._load_stack(record.he_paths, transform=tfm)
+    #     ret_stack = self._load_stack(record.ret_paths, transform=tfm)
+    #     grade = torch.tensor(record.grade, dtype=torch.long)
+    #     return he_stack, ret_stack, grade, record.contrastive_id
+
+    # def __getitem__(self, idx: int):
+    #     return self.get_slide(idx)
+
+    # def filter_slides(self, allowed_ids: set[str]) -> int:
+    #     before = len(self.entries)
+    #     if before == 0:
+    #         return 0
+    #     self.entries = [entry for entry in self.entries if entry.contrastive_id in allowed_ids]
+    #     removed = before - len(self.entries)
+    #     if not self.entries:
+    #         raise RuntimeError("Filtering removed all slides; check embedding bank coverage.")
+    #     return removed
+
+    # def serialize_entries(self, indices: Sequence[int]) -> list[dict[str, Any]]:
+    #     return [self._serialize_record(self.entries[i]) for i in indices]
+
+    # @staticmethod
+    # def _serialize_record(record: SlideRecord) -> dict[str, Any]:
+    #     return {
+    #         "lab_id": record.lab_id,
+    #         "he_stain_id": record.he_stain_id,
+    #         "ret_stain_id": record.ret_stain_id,
+    #         "grade": record.grade,
+    #         "he_paths": [str(p) for p in record.he_paths],
+    #         "ret_paths": [str(p) for p in record.ret_paths],
+    #     }
+
+    # @staticmethod
+    # def _deserialize_record(payload: dict[str, Any]) -> SlideRecord:
+    #     return SlideRecord(
+    #         lab_id=payload["lab_id"],
+    #         he_stain_id=payload["he_stain_id"],
+    #         ret_stain_id=payload["ret_stain_id"],
+    #         grade=int(payload["grade"]),
+    #         he_paths=[Path(p) for p in payload["he_paths"]],
+    #         ret_paths=[Path(p) for p in payload["ret_paths"]],
+    #     )
+
+    # @classmethod
+    # def from_serialized(
+    #     cls,
+    #     entries: Sequence[dict[str, Any]],
+    #     args: argparse.Namespace,
+    # ) -> SlidePatchDataset:
+    #     records = [cls._deserialize_record(entry) for entry in entries]
+    #     legacy_roots = (
+    #         [Path(p) for p in getattr(args, "legacy_root", [])]
+    #         if getattr(args, "legacy_root", None)
+    #         else None
+    #     )
+    #     return cls(
+    #         metadata_csv=Path(args.metadata),
+    #         data_root=Path(args.data_root) if args.data_root else None,
+    #         patches_per_slide=args.patches_per_slide,
+    #         image_size=args.image_size,
+    #         augment=not args.no_augment,
+    #         seed=args.seed,
+    #         patch_retries=args.patch_retries,
+    #         subset_pct=None,
+    #         subset_order=args.subset_order,
+    #         legacy_roots=legacy_roots,
+    #         entries=records,
+    #     )
+
+
+class SlidewisePatchDataset(Dataset):
     def __init__(
         self,
-        metadata_csv: Path,
-        data_root: Optional[Path],
-        patches_per_slide: int,
-        image_size: int,
-        augment: bool,
-        seed: int,
-        max_slides: Optional[int] = None,
-        patch_retries: int = 8,
-        subset_pct: Optional[float] = None,
-        subset_order: str = "random",
-        legacy_roots: Optional[Sequence[Path]] = None,
-        entries: Optional[list[SlideRecord]] = None,
-    ) -> None:
-        self.metadata_path = resolve_path(metadata_csv)
-        self.patch_root = resolve_path(data_root or self.metadata_path.parent)
-        self.patches_per_slide = patches_per_slide
-        self.train_transform = _build_patch_transform(image_size, augment)
-        self.eval_transform = _build_patch_transform(image_size, augment=False)
-        self.patch_retries = max(1, patch_retries)
-        self.rng = random.Random(seed)
-        self.subset_pct = subset_pct
-        self.subset_order = subset_order
-        self.legacy_roots: list[Path] = []
-        for root in legacy_roots or []:
-            try:
-                resolved = Path(root).expanduser().resolve()
-            except FileNotFoundError:
-                resolved = Path(root).expanduser()
-            self.legacy_roots.append(resolved)
-        self.missing_patch_paths = 0
-        self._missing_log_limit = 20
-        if entries is not None:
-            self.entries = entries
-        else:
-            self.entries = self._build_entries(max_slides)
-        if not self.entries:
-            raise RuntimeError("No slides with both H&E and Reticulin patches were found.")
-        if self.missing_patch_paths:
-            LOGGER.warning("Skipped %d patch files that were missing on disk.", self.missing_patch_paths)
-
-    def _normalize_path(self, raw: str) -> Path:
-        normalized = raw.replace("\\", "/")
-        path = Path(normalized)
-
-        # If it's an absolute path, try to remap from any legacy root to the current project layout.
-        if path.is_absolute():
-            if path.exists():
-                return path
-            for legacy_root in self.legacy_roots:
-                try:
-                    relative = path.relative_to(legacy_root)
-                except ValueError:
-                    continue
-                remapped = (self.patch_root / relative).resolve()
-                if remapped.exists():
-                    return remapped
-            # No remap possible or remapped target missing; return original path.
-            return path
-
-        candidate = (self.patch_root / path).resolve()
-        if candidate.exists():
-            return candidate
-        for legacy_root in self.legacy_roots:
-            alt = (legacy_root / path).resolve()
-            if alt.exists():
-                return alt
-        return candidate
-
-    def _collect_valid_paths(self, raw_paths: Sequence[str]) -> list[Path]:
-        paths: list[Path] = []
-        for raw in raw_paths:
-            path = self._normalize_path(str(raw))
-            if not path.is_file():
-                self.missing_patch_paths += 1
-                if self.missing_patch_paths <= self._missing_log_limit:
-                    LOGGER.warning("Patch file not found: %s", path)
-                elif self.missing_patch_paths == self._missing_log_limit + 1:
-                    LOGGER.warning("Too many missing patch files; suppressing additional warnings.")
-                continue
-            paths.append(path)
-        return paths
-
-    def _build_entries(self, max_slides: Optional[int]) -> list[SlideRecord]:
-        df = pd.read_csv(self.metadata_path)
-        required = {"Lab No.", "stain_id", "type", "patch_path", "Reticulin Grade"}
-        if required - set(df.columns):
-            missing = required - set(df.columns)
-            raise ValueError(f"metadata missing required columns: {sorted(missing)}")
-
-        df["type_norm"] = df["type"].astype(str).str.lower()
-        df["patch_path_norm"] = df["patch_path"].astype(str)
-        df["lab_id"] = df["Lab No."].astype(str).str.strip()
-        df = df[df["lab_id"].astype(bool)]
-        if self.subset_pct is not None:
-            pct = max(0.0, min(100.0, float(self.subset_pct)))
-            unique_labs = df["lab_id"].unique().tolist()
-            target = max(1, int(round(len(unique_labs) * (pct / 100.0))))
-            if target < len(unique_labs):
-                if self.subset_order == "ascending":
-                    labs_sorted = sorted(unique_labs)
-                    selected = labs_sorted[:target]
-                elif self.subset_order == "descending":
-                    labs_sorted = sorted(unique_labs, reverse=True)
-                    selected = labs_sorted[:target]
-                else:
-                    selected = self.rng.sample(unique_labs, target)
-                df = df[df["lab_id"].isin(selected)]
-            LOGGER.info(
-                "Subset active (%s): %.2f%% of labs -> %d labs",
-                self.subset_order,
-                pct,
-                df["lab_id"].nunique(),
-            )
-        entries: list[SlideRecord] = []
-        for lab_id, lab_df in df.groupby("lab_id"):
-            he_df = lab_df[lab_df["type_norm"].str.contains("h&e", na=False)]
-            ret_df = lab_df[lab_df["type_norm"].str.contains("reticulin", na=False)]
-            if he_df.empty or ret_df.empty:
-                continue
-
-            he_groups = {str(sid): group for sid, group in he_df.groupby("stain_id")}
-            ret_groups = {str(sid): group for sid, group in ret_df.groupby("stain_id")}
-            ret_ids = list(ret_groups.keys())
-
-            for he_id, he_group in he_groups.items():
-                ret_id = _closest_stain_id(he_id, ret_ids)
-                if ret_id is None:
-                    continue
-                ret_group = ret_groups[ret_id]
-                grade_value = _parse_grade(ret_group["Reticulin Grade"].iloc[0])
-                if grade_value is None:
-                    continue
-
-                he_paths = self._collect_valid_paths(he_group["patch_path_norm"].tolist())
-                ret_paths = self._collect_valid_paths(ret_group["patch_path_norm"].tolist())
-                if not he_paths or not ret_paths:
-                    continue
-
-                entries.append(
-                    SlideRecord(
-                        lab_id=str(lab_id),
-                        he_stain_id=he_id,
-                        ret_stain_id=ret_id,
-                        grade=grade_value,
-                        he_paths=he_paths,
-                        ret_paths=ret_paths,
-                    )
-                )
-                if max_slides is not None and len(entries) >= max_slides:
-                    return entries
-        return entries
-
-    def __len__(self) -> int:
-        return len(self.entries)
-
-    def _load_stack(self, paths: list[Path], transform: Optional[T.Compose] = None) -> torch.Tensor:
-        images: list[torch.Tensor] = []
-        pool = list(paths)
-        if not pool:
-            raise RuntimeError("Slide has no available patches.")
-        indices: list[int]
-        if len(pool) >= self.patches_per_slide:
-            indices = self.rng.sample(range(len(pool)), self.patches_per_slide)
-        else:
-            indices = [self.rng.randrange(len(pool)) for _ in range(self.patches_per_slide)]
-        attempts = 0
-        max_attempts = self.patch_retries * self.patches_per_slide
-        ptr = 0
-        while len(images) < self.patches_per_slide and attempts < max_attempts:
-            path = pool[indices[ptr % len(indices)]]
-            ptr += 1
-            attempts += 1
-            try:
-                with Image.open(path) as img:
-                    tfm = transform or self.train_transform
-                    tensor = tfm(img.convert("RGB"))
-            except (FileNotFoundError, UnidentifiedImageError, OSError) as exc:
-                LOGGER.warning("Failed to load patch %s (%s)", path, exc)
-                continue
-            images.append(tensor)
-        if len(images) < self.patches_per_slide:
-            raise RuntimeError(f"Unable to collect {self.patches_per_slide} patches from {paths[0].parent}")
-        return torch.stack(images, dim=0)
-
-    def get_slide(
-        self,
-        idx: int,
-        *,
-        deterministic: bool = False,
-    ):
-        record = self.entries[idx]
-        tfm = self.eval_transform if deterministic else self.train_transform
-        he_stack = self._load_stack(record.he_paths, transform=tfm)
-        ret_stack = self._load_stack(record.ret_paths, transform=tfm)
-        grade = torch.tensor(record.grade, dtype=torch.long)
-        return he_stack, ret_stack, grade, record.contrastive_id
-
-    def __getitem__(self, idx: int):
-        return self.get_slide(idx)
-
-    def filter_slides(self, allowed_ids: set[str]) -> int:
-        before = len(self.entries)
-        if before == 0:
-            return 0
-        self.entries = [entry for entry in self.entries if entry.contrastive_id in allowed_ids]
-        removed = before - len(self.entries)
-        if not self.entries:
-            raise RuntimeError("Filtering removed all slides; check embedding bank coverage.")
-        return removed
-
-    def serialize_entries(self, indices: Sequence[int]) -> list[dict[str, Any]]:
-        return [self._serialize_record(self.entries[i]) for i in indices]
-
-    @staticmethod
-    def _serialize_record(record: SlideRecord) -> dict[str, Any]:
-        return {
-            "lab_id": record.lab_id,
-            "he_stain_id": record.he_stain_id,
-            "ret_stain_id": record.ret_stain_id,
-            "grade": record.grade,
-            "he_paths": [str(p) for p in record.he_paths],
-            "ret_paths": [str(p) for p in record.ret_paths],
-        }
-
-    @staticmethod
-    def _deserialize_record(payload: dict[str, Any]) -> SlideRecord:
-        return SlideRecord(
-            lab_id=payload["lab_id"],
-            he_stain_id=payload["he_stain_id"],
-            ret_stain_id=payload["ret_stain_id"],
-            grade=int(payload["grade"]),
-            he_paths=[Path(p) for p in payload["he_paths"]],
-            ret_paths=[Path(p) for p in payload["ret_paths"]],
-        )
-
-    @classmethod
-    def from_serialized(
-        cls,
-        entries: Sequence[dict[str, Any]],
-        args: argparse.Namespace,
-    ) -> SlidePatchDataset:
-        records = [cls._deserialize_record(entry) for entry in entries]
-        legacy_roots = (
-            [Path(p) for p in getattr(args, "legacy_root", [])]
-            if getattr(args, "legacy_root", None)
-            else None
-        )
-        return cls(
-            metadata_csv=Path(args.metadata),
-            data_root=Path(args.data_root) if args.data_root else None,
-            patches_per_slide=args.patches_per_slide,
-            image_size=args.image_size,
-            augment=not args.no_augment,
-            seed=args.seed,
-            patch_retries=args.patch_retries,
-            subset_pct=None,
-            subset_order=args.subset_order,
-            legacy_roots=legacy_roots,
-            entries=records,
-        )
-
-
-class AugmentedSlideDataset(Dataset):
-    def __init__(
-        self,
-        slides: list[AugmentedSlide],
+        slides: list[Slide],
         patches_per_slide: int,
         image_size: int,
         augment: bool,
@@ -565,7 +513,7 @@ class AugmentedSlideDataset(Dataset):
         top_fraction: float = 0.25,
     ) -> None:
         if not slides:
-            raise ValueError("AugmentedSlideDataset received an empty slide list.")
+            raise ValueError("SlidewisePatchDataset received an empty slide list.")
         self.entries = slides
         self.seed = seed
         self.patches_per_slide = patches_per_slide
@@ -745,7 +693,7 @@ def _pad_chunks(chunks: list[list[int]], target: int) -> list[list[int]]:
 
 
 def _build_slide_schedule(
-    slide: AugmentedSlide,
+    slide: Slide,
     patches_per_slide: int,
     top_fraction: float,
     rng: random.Random,
@@ -771,7 +719,7 @@ def _build_slide_schedule(
 
 
 def _build_epoch_schedule(
-    slides: Sequence[AugmentedSlide],
+    slides: Sequence[Slide],
     slide_indices: Sequence[int],
     patches_per_slide: int,
     top_fraction: float,
@@ -805,7 +753,7 @@ def _chunk_indices_for_stack(
 
 
 def _load_chunk_stack(
-    dataset: AugmentedSlideDataset,
+    dataset: SlidewisePatchDataset,
     paths: Sequence[Path],
     chunk_indices: list[int],
     deterministic: bool,
@@ -870,20 +818,20 @@ class SlideEmbeddingBank:
         return torch.stack(selected, dim=0)
 
 
-def build_dataset(args: argparse.Namespace) -> SlidePatchDataset:
-    return SlidePatchDataset(
-        metadata_csv=Path(args.metadata),
-        data_root=Path(args.data_root) if args.data_root else None,
-        patches_per_slide=args.patches_per_slide,
-        image_size=args.image_size,
-        augment=not args.no_augment,
-        seed=args.seed,
-        max_slides=args.max_slide_count,
-        patch_retries=args.patch_retries,
-        subset_pct=args.subset,
-        subset_order=args.subset_order,
-        legacy_roots=[Path(p) for p in getattr(args, "legacy_root", [])] if getattr(args, "legacy_root", None) else None,
-    )
+# def build_dataset(args: argparse.Namespace) -> SlidePatchDataset:
+#     return SlidePatchDataset(
+#         metadata_csv=Path(args.metadata),
+#         data_root=Path(args.data_root) if args.data_root else None,
+#         patches_per_slide=args.patches_per_slide,
+#         image_size=args.image_size,
+#         augment=not args.no_augment,
+#         seed=args.seed,
+#         max_slides=args.max_slide_count,
+#         patch_retries=args.patch_retries,
+#         subset_pct=args.subset,
+#         subset_order=args.subset_order,
+#         legacy_roots=[Path(p) for p in getattr(args, "legacy_root", [])] if getattr(args, "legacy_root", None) else None,
+#     )
 
 
 def build_dataloader(
@@ -902,63 +850,63 @@ def build_dataloader(
     )
 
 
-def build_loader(args: argparse.Namespace) -> tuple[SlidePatchDataset, DataLoader]:
-    dataset = build_dataset(args)
-    loader = build_dataloader(dataset, args)
-    return dataset, loader
+# def build_loader(args: argparse.Namespace) -> tuple[SlidePatchDataset, DataLoader]:
+#     dataset = build_dataset(args)
+#     loader = build_dataloader(dataset, args)
+#     return dataset, loader
 
 
-def build_split_loaders(
-    dataset: SlidePatchDataset,
-    args: argparse.Namespace,
-    *,
-    return_indices: bool = False,
-) -> tuple[dict[str, DataLoader | None], dict[str, list[int]]] | dict[str, DataLoader | None]:
-    total = len(dataset)
-    if total < 3:
-        loader = build_dataloader(dataset, args)
-        result = {"train": loader, "val": None, "test": None}
-        if return_indices:
-            return result, {"train": list(range(total)), "val": [], "test": []}
-        return result
-    val_count = int(total * args.val_ratio)
-    test_count = int(total * args.test_ratio)
-    if val_count + test_count > total - 2:
-        # Ensure at least 2 slides remain for training.
-        shrink = (val_count + test_count) - (total - 2)
-        if shrink > 0:
-            if test_count >= shrink:
-                test_count -= shrink
-            else:
-                shrink -= test_count
-                test_count = 0
-                val_count = max(0, val_count - shrink)
-    train_count = total - val_count - test_count
-    generator = torch.Generator().manual_seed(args.seed)
-    perm = torch.randperm(total, generator=generator).tolist()
-    train_idx = perm[:train_count]
-    val_idx = perm[train_count : train_count + val_count]
-    test_idx = perm[train_count + val_count :]
+# def build_split_loaders(
+#     dataset: SlidePatchDataset,
+#     args: argparse.Namespace,
+#     *,
+#     return_indices: bool = False,
+# ) -> tuple[dict[str, DataLoader | None], dict[str, list[int]]] | dict[str, DataLoader | None]:
+#     total = len(dataset)
+#     if total < 3:
+#         loader = build_dataloader(dataset, args)
+#         result = {"train": loader, "val": None, "test": None}
+#         if return_indices:
+#             return result, {"train": list(range(total)), "val": [], "test": []}
+#         return result
+#     val_count = int(total * args.val_ratio)
+#     test_count = int(total * args.test_ratio)
+#     if val_count + test_count > total - 2:
+#         # Ensure at least 2 slides remain for training.
+#         shrink = (val_count + test_count) - (total - 2)
+#         if shrink > 0:
+#             if test_count >= shrink:
+#                 test_count -= shrink
+#             else:
+#                 shrink -= test_count
+#                 test_count = 0
+#                 val_count = max(0, val_count - shrink)
+#     train_count = total - val_count - test_count
+#     generator = torch.Generator().manual_seed(args.seed)
+#     perm = torch.randperm(total, generator=generator).tolist()
+#     train_idx = perm[:train_count]
+#     val_idx = perm[train_count : train_count + val_count]
+#     test_idx = perm[train_count + val_count :]
 
-    subsets: dict[str, Subset | None] = {
-        "train": Subset(dataset, train_idx),
-        "val": Subset(dataset, val_idx) if val_idx else None,
-        "test": Subset(dataset, test_idx) if test_idx else None,
-    }
+#     subsets: dict[str, Subset | None] = {
+#         "train": Subset(dataset, train_idx),
+#         "val": Subset(dataset, val_idx) if val_idx else None,
+#         "test": Subset(dataset, test_idx) if test_idx else None,
+#     }
 
-    loaders: dict[str, DataLoader | None] = {}
-    for name, subset in subsets.items():
-        if subset is None or len(subset) == 0:  # type: ignore[arg-type]
-            loaders[name] = None
-            continue
-        loaders[name] = build_dataloader(
-            subset,
-            args,
-            shuffle=name == "train",
-        )
-    if return_indices:
-        return loaders, {"train": train_idx, "val": val_idx, "test": test_idx}
-    return loaders
+#     loaders: dict[str, DataLoader | None] = {}
+#     for name, subset in subsets.items():
+#         if subset is None or len(subset) == 0:  # type: ignore[arg-type]
+#             loaders[name] = None
+#             continue
+#         loaders[name] = build_dataloader(
+#             subset,
+#             args,
+#             shuffle=name == "train",
+#         )
+#     if return_indices:
+#         return loaders, {"train": train_idx, "val": val_idx, "test": test_idx}
+#     return loaders
 
 
 class ProjectionHead(nn.Module):
@@ -1066,7 +1014,7 @@ def evaluate_split(
             fake_ret = G_H2R(he_flat).view_as(ret_batch)
 
             z_fake = extract_patch_features(
-                feature_extractor, fake_ret, mean, std, require_grad=False
+                feature_extractor_model, fake_ret, mean, std, require_grad=False
             )
             cls_loss, logits = compute_classification_loss(
                 z_fake, grades, abmil, slide_classifier, criterion_cls
@@ -1207,7 +1155,7 @@ def compute_classification_loss(
     logits: list[torch.Tensor] = []
     for idx in range(z_fake.size(0)):
         bag = z_fake[idx]
-        slide_vec, _ = abmil.pool(bag)
+        slide_vec, _ = abmil.pool(bag) #
         logit = classifier(slide_vec.unsqueeze(0))
         logits.append(logit)
     stacked = torch.cat(logits, dim=0)
@@ -1255,6 +1203,15 @@ def compute_contrastive_loss_with_bank(
         raise ValueError("slide_ids length must match batch size.")
     device = z_fake.device
 
+    # For contrastive loss, we get embeddings for the real reticulin patches and the fake/generated reticulin patches
+    # For the real reticulin patches, we already get pooled embeddings
+    # For the fake/generated patches, we get individual patch embeddings and we pool them here. Here pooling is done from the trained ABMIL model
+    # We pass the real and fake pooled embeddings through a MLP that gets their features.
+    # Anchors are the fake patch embeddings that are generated from the pooling. 
+    # These are used to calculate the distances from +ve and -ve samples.
+    # Positive pairs: Anchor vs embeddings of real reticulin samples from the "same" subject that is in the training batch
+    # Negative pairs: Anchor vs embeddings of real reticulin samples from "different" subject that is in the training batch
+
     # Collect only those slides that have an embedding in the bank.
     valid_indices: list[int] = []
     anchor_embeddings: list[torch.Tensor] = []
@@ -1281,7 +1238,7 @@ def compute_contrastive_loss_with_bank(
     # Exclude all valid ids from being used as negatives for any anchor.
     exclude_batch = set(valid_ids)
     for local_idx, sid in enumerate(valid_ids):
-        exclude = set(exclude_batch)
+        exclude = set(exclude_batch) #remove the samples from any ids that are in this training set
         exclude.add(sid)
         negatives = bank.sample(exclude, num_negatives).to(device)
         q_neg = F.normalize(projector(negatives), dim=1)
@@ -1289,9 +1246,9 @@ def compute_contrastive_loss_with_bank(
         q_pos = F.normalize(projector(pos_tensor), dim=1)
 
         anchor = q_fake[local_idx]
-        pos_logits = (q_pos @ anchor) / temperature
-        neg_logits = (q_neg @ anchor) / temperature
-        all_logits = torch.cat([pos_logits, neg_logits], dim=0)
+        pos_logits = torch.matmul(q_pos, anchor)/ temperature #maximize this, s+
+        neg_logits = torch.matmul(q_neg, anchor)/ temperature #minimize this, s-
+        all_logits = torch.cat([pos_logits, neg_logits], dim=0) # [s+, s-]
         loss = -(torch.logsumexp(pos_logits, dim=0) - torch.logsumexp(all_logits, dim=0))
         losses.append(loss)
 
@@ -1315,6 +1272,7 @@ def _pool_real_slide_embeddings(vectors: Sequence[torch.Tensor], top_flags: Sequ
     if selected.size(0) == 1:
         return selected[0]
 
+    #mean-shift, radial basis (RBF) kernel attention, or soft-medoid pooling
     center = selected.mean(dim=0, keepdim=True)
     scale = max(selected.size(1), 1) ** 0.5
     attn_logits = (selected * center).sum(dim=1) / scale
@@ -1322,7 +1280,8 @@ def _pool_real_slide_embeddings(vectors: Sequence[torch.Tensor], top_flags: Sequ
     return torch.sum(attn.unsqueeze(1) * selected, dim=0)
 
 
-def load_embedding_bank(root: Path, dataset: SlidePatchDataset) -> SlideEmbeddingBank:
+def load_embedding_bank(root: Path, dataset: SlidewisePatchDataset) -> SlideEmbeddingBank:
+    #we get one embedding for the entire slide instead.
     root = resolve_path(root)
     if not root.exists():
         raise FileNotFoundError(f"Reticulin embedding directory not found: {root}")
@@ -1512,13 +1471,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--augmented-slides",
         type=str,
         required=False, #shubham
-        help="Path to augmented_slides.json produced by build_augmented_dataset.py",
+        help="Path to slides.json produced by build_augmented_dataset.py",
     )
     parser.add_argument(
         "--augmented-splits",
         type=str,
         required=False, #shubham
-        help="Path to augmented_splits.json produced by build_augmented_dataset.py",
+        help="Path to splits.json produced by build_augmented_dataset.py",
     )
     parser.add_argument("--batch-slides", type=int, default=2)
     parser.add_argument("--patches-per-slide", type=int, default=32)
@@ -1534,11 +1493,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pretrained-encoder", type=str, default=None)
     parser.add_argument("--pretrained-abmil", type=str, default=None)
     parser.add_argument("--pretrained-classifier", type=str, default=None)
-    parser.add_argument("--log-dir", type=str, default=str(PROJECT_ROOT / "outputs" / "logs" / "augmented_cyclegan"))
+    parser.add_argument("--log-dir", type=str, default=str(PROJECT_ROOT / "outputs" / "logs" / "cyclegan"))
     parser.add_argument(
         "--samples-dir",
         type=str,
-        default=str(PROJECT_ROOT / "outputs" / "samples" / "augmented_cyclegan"),
+        default=str(PROJECT_ROOT / "outputs" / "samples" / "cyclegan"),
         help="Directory where epoch sample grids are stored.",
     )
     parser.add_argument("--run-id", type=str, required=True)
@@ -1737,6 +1696,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.legacy_root = [
             str(resolve_path(path, allow_missing=True)) for path in args.legacy_root
         ]
+
+    
+    config_dict = vars(args)
+    with open(os.path.join("PROJECT_ROOT/outputs/logs/cyclegan/" + run_id + '_config.json'), "w") as :
+        json.dump(config_dict, json_file, indent=4)
+
     return args
 
 
@@ -1784,12 +1749,12 @@ def train(args: argparse.Namespace) -> None:
             "with precomputed reticulin embeddings."
         )
     
-    splits = load_augmented_splits(Path(args.augmented_splits))
+    splits = load_splits(Path(args.augmented_splits))
 
     required_indices = sorted(set(splits["train"] + splits["val"] + splits["test"]))
     
-    slides, index_map = load_augmented_slides_filtered(
-    Path(args.augmented_slides),
+    slides, index_map = remap_load_slides(
+    Path(args.slides),
     Path(args.data_root) if args.data_root else None,
     required_indices,
 )
@@ -1825,7 +1790,7 @@ def train(args: argparse.Namespace) -> None:
     splits["val"]   = remap(splits["val"])
     splits["test"]  = remap(splits["test"])
 
-    dataset = AugmentedSlideDataset(
+    dataset = SlidewisePatchDataset(
         slides=slides,
         patches_per_slide=args.patches_per_slide,
         image_size=args.image_size,
@@ -1849,10 +1814,10 @@ def train(args: argparse.Namespace) -> None:
 
     val_loader = build_dataloader(val_subset, args, shuffle=False) if val_subset else None
     test_loader = build_dataloader(test_subset, args, shuffle=False) if test_subset else None
-    dataset_for_preview = dataset
+    dataset_for_preview = dataset #he_stack, ret_stack, grade, record.contrastive_id
 
 
-    embedding_bank = _load_cache(args.cache_embedding_bank, "embedding bank", args.no_cache)
+    embedding_bank = _load_cache(args.cache_embedding_bank, "embedding bank", args.no_cache) #
     if embedding_bank is None:
         embedding_bank = load_embedding_bank(Path(args.reticulin_embedding_dir), dataset)
         LOGGER.info(
@@ -1883,12 +1848,12 @@ def train(args: argparse.Namespace) -> None:
         args.contrastive_negatives,
     )
 
-    feature_extractor = build_feature_extractor(args, device)
+    feature_extractor_model = build_feature_extractor(args, device) #SimCLR being loaded
     mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, -1, 1, 1)
     std = torch.tensor(IMAGENET_STD, device=device).view(1, -1, 1, 1)
 
-    sample_he, sample_ret, _, _ = dataset_for_preview[0]
-    feat_dim = infer_feature_dim(feature_extractor, sample_ret.unsqueeze(0).to(device), mean, std)
+    sample_he, sample_ret, _, _ = dataset_for_preview[0] #he_stack, ret_stack, grade, record.contrastive_id
+    feat_dim = infer_feature_dim(feature_extractor_model, sample_ret.unsqueeze(0).to(device), mean, std)
     LOGGER.info("Feature dimension inferred as %d", feat_dim)
 
     # abmil = ABMIL(
@@ -1919,7 +1884,7 @@ def train(args: argparse.Namespace) -> None:
     ).to(device)
 
     _load_state_dict(abmil, resolve_path(args.pretrained_abmil))
-    abmil.train()
+    abmil.train() ###
 
     slide_classifier = SlideClassifier(
         feat_dim,
@@ -1929,9 +1894,7 @@ def train(args: argparse.Namespace) -> None:
     ).to(device)
 
     _load_state_dict(slide_classifier, resolve_path(args.pretrained_classifier))
-    slide_classifier.train()
-    #shubham
-
+    slide_classifier.train() ###
 
     projector = ProjectionHead(feat_dim, args.proj_hidden_dim, args.proj_out_dim).to(device)
 
@@ -1941,22 +1904,22 @@ def train(args: argparse.Namespace) -> None:
     D_H = CycleDiscriminator(in_channels=3).to(device)
     load_cyclegan_weights(Path(args.pretrained_cyclegan), (G_H2R, G_R2H), (D_R, D_H))
 
-    opt_G = torch.optim.Adam(
+    optimizer_G = torch.optim.Adam(
         list(G_H2R.parameters()) +
         list(G_R2H.parameters()) +
-        list(projector.parameters()),
+        list(projector.parameters()), ### the ProjectorHead
         lr=args.lr_gen,
         betas=(0.5, 0.999),
     )
 
-    opt_C = torch.optim.Adam(
+    optimizer_cls = torch.optim.Adam(
         list(abmil.parameters()) +
         list(slide_classifier.parameters()),
         lr=1e-4,
         betas=(0.9, 0.999),
     )
 
-    opt_D = torch.optim.Adam(
+    optimizer_D = torch.optim.Adam(
         list(D_R.parameters()) +
         list(D_H.parameters()),
         lr=args.lr_disc,
@@ -1966,13 +1929,16 @@ def train(args: argparse.Namespace) -> None:
     criterion_gan = nn.MSELoss()
     l1_loss = nn.L1Loss()
     criterion_cls = nn.CrossEntropyLoss()
+    
     grad_enabled = bool(args.grad_req)
     if not grad_enabled:
         LOGGER.warning("grad_req set to False – running in inference-only mode (no optimizer steps).")
+    
     use_amp = bool(args.amp and device.type == "cuda" and grad_enabled)
     if args.amp and not use_amp and device.type != "cuda":
         LOGGER.warning("AMP requested but device %s does not support CUDA autocast.", device.type)
     LOGGER.info("AMP enabled: %s", use_amp)
+    
     scaler_G = torch.amp.GradScaler("cuda") if use_amp else None
     scaler_D = torch.amp.GradScaler("cuda") if use_amp else None
     amp_context = (lambda: torch.amp.autocast(device_type="cuda")) if use_amp else nullcontext
@@ -1985,9 +1951,9 @@ def train(args: argparse.Namespace) -> None:
         "D_H": D_H,
     }
     optimizer_states = {
-        "opt_G": opt_G if grad_enabled else None,
-        "opt_C": opt_C if grad_enabled else None,
-        "opt_D": opt_D if grad_enabled else None,
+        "opt_G": optimizer_G if grad_enabled else None,
+        "opt_C": optimizer_cls if grad_enabled else None,
+        "opt_D": optimizer_D if grad_enabled else None,
     }
     scaler_states = {
         "scaler_G": scaler_G if use_amp else None,
@@ -2041,9 +2007,10 @@ def train(args: argparse.Namespace) -> None:
         G_R2H.train()
         D_R.train()
         D_H.train()
-        abmil.train()
-        slide_classifier.train()
-        projector.train()
+        abmil.train() ###
+        slide_classifier.train() ###
+        projector.train() ###
+
         epoch_metrics = {
             "G": 0.0,
             "D": 0.0,
@@ -2127,6 +2094,8 @@ def train(args: argparse.Namespace) -> None:
                 ret_flat = ret_batch.view(-1, *ret_batch.shape[2:])
 
                 with amp_context():
+                    
+                    #Generator
                     fake_ret_flat = G_H2R(he_flat)
                     fake_he_flat = G_R2H(ret_flat)
                     fake_ret = fake_ret_flat.view_as(ret_batch)
@@ -2135,25 +2104,23 @@ def train(args: argparse.Namespace) -> None:
                     rec_he = G_R2H(fake_ret_flat).view_as(he_batch)
                     rec_ret = G_H2R(fake_he_flat).view_as(ret_batch)
 
-                    id_ret = G_H2R(ret_flat).view_as(ret_batch)
-                    id_he = G_R2H(he_flat).view_as(he_batch)
+                    cycle_loss = l1_loss(rec_he, he_batch) + l1_loss(rec_ret, ret_batch)
 
+                    #Discriminator
                     pred_fake_ret = D_R(fake_ret_flat)
                     pred_fake_he = D_H(fake_he_flat)
                     adv_loss = criterion_gan(pred_fake_ret, torch.ones_like(pred_fake_ret)) + criterion_gan(
                         pred_fake_he, torch.ones_like(pred_fake_he)
                     )
 
-                    cycle_loss = l1_loss(rec_he, he_batch) + l1_loss(rec_ret, ret_batch)
-
                     if args.lambda_identity > 0:
-                        id_ret = G_H2R(ret_flat).view_as(ret_batch)
-                        id_he = G_R2H(he_flat).view_as(he_batch)
+                        id_ret = G_H2R(ret_flat).view_as(ret_batch) # G_H2R should still return Reticulin if it is given an input of Reticulin 
+                        id_he = G_R2H(he_flat).view_as(he_batch) # G_R2H should still return HE if it is given an input of HE
                         id_loss = l1_loss(id_ret, ret_batch) + l1_loss(id_he, he_batch)
                     else:
                         id_loss = torch.zeros((), device=device)
 
-                z_fake = extract_patch_features(feature_extractor, fake_ret, mean, std, require_grad=True)
+                z_fake = extract_patch_features(feature_extractor_model, fake_ret, mean, std, require_grad=True)
                 cls_loss, _ = compute_classification_loss(z_fake, grades_tensor, abmil, slide_classifier, criterion_cls)
                 contrastive_loss = compute_contrastive_loss_with_bank(
                     z_fake,
@@ -2170,8 +2137,8 @@ def train(args: argparse.Namespace) -> None:
                 weighted_adv = adv_loss
                 weighted_cycle = args.lambda_cycle * cycle_loss
                 weighted_identity = id_weight * id_loss
-                weighted_cls = args.lambda_cls * cls_loss
-                weighted_con = args.lambda_con * contrastive_loss
+                weighted_cls = args.lambda_cls * cls_loss ###
+                weighted_con = args.lambda_con * contrastive_loss ###
 
                 if grad_enabled:
                     grad_adv = component_grad_norm(weighted_adv, grad_modules)
@@ -2182,18 +2149,25 @@ def train(args: argparse.Namespace) -> None:
                 else:
                     grad_adv = grad_cycle = grad_identity = grad_cls = grad_con = 0.0
 
-                loss_G = weighted_adv + weighted_cycle + weighted_identity + weighted_cls + weighted_con
+                loss_G = weighted_adv + weighted_cycle + weighted_identity + weighted_cls + weighted_con ###
 
                 if grad_enabled:
-                    opt_G.zero_grad(set_to_none=True)
+                    optimizer_G.zero_grad(set_to_none=True)
                     if use_amp:
                         assert scaler_G is not None
                         scaler_G.scale(loss_G).backward()
-                        scaler_G.step(opt_G)
+                        scaler_G.step(optimizer_G)
+                        scaler_G.update()
+
+                        scaler_G.scale(loss_G).backward() ###
+                        scaler_G.step(optimizer_cls) ###
                         scaler_G.update()
                     else:
-                        loss_G.backward()
-                        opt_G.step()
+                        loss_G.backward() ###
+                        optimizer_G.step() ###
+
+                        loss_G.backward() ###
+                        optimizer_cls.step() ###
                 else:
                     loss_G = loss_G.detach()
 
@@ -2203,47 +2177,47 @@ def train(args: argparse.Namespace) -> None:
                     loss_D = D_R_loss + D_H_loss
 
                 if grad_enabled:
-                    opt_D.zero_grad(set_to_none=True)
+                    optimizer_D.zero_grad(set_to_none=True)
                     if use_amp:
                         assert scaler_D is not None
                         scaler_D.scale(loss_D).backward()
-                        scaler_D.step(opt_D)
+                        scaler_D.step(optimizer_D)
                         scaler_D.update()
                     else:
                         loss_D.backward()
-                        opt_D.step()
+                        optimizer_D.step()
                 else:
                     loss_D = loss_D.detach()
 
                 # -------------------------
                 # Classifier update
                 # -------------------------
-                if grad_enabled and args.lambda_cls > 0:
-                    opt_C.zero_grad(set_to_none=True)
-                    with amp_context():
-                        cls_loss_c, _ = compute_classification_loss(
-                            z_fake.detach(),
-                            grades_tensor,
-                            abmil,
-                            slide_classifier,
-                            criterion_cls,
-                        )
-                        weighted_cls_c = args.lambda_cls * cls_loss_c
+                # if grad_enabled and args.lambda_cls > 0:
+                #     optimizer_cls.zero_grad(set_to_none=True)
+                #     with amp_context():
+                #         cls_loss_c, _ = compute_classification_loss(
+                #             z_fake.detach(),
+                #             grades_tensor,
+                #             abmil,
+                #             slide_classifier,
+                #             criterion_cls,
+                #         )
+                #         weighted_cls_c = args.lambda_cls * cls_loss_c
 
-                    if use_amp:
-                        assert scaler_G is not None
-                        scaler_G.scale(weighted_cls_c).backward()
-                        scaler_G.step(opt_C)
-                        scaler_G.update()
-                    else:
-                        weighted_cls_c.backward()
-                        opt_C.step()
+                #     if use_amp:
+                #         assert scaler_G is not None
+                #         scaler_G.scale(weighted_cls_c).backward()
+                #         scaler_G.step(optimizer_cls)
+                #         scaler_G.update()
+                #     else:
+                #         weighted_cls_c.backward()
+                #         optimizer_cls.step()
                         
-                if not grad_enabled:
-                    loss_G = loss_G.detach()
-                    loss_D = loss_D.detach()
-                    cls_loss = cls_loss.detach()
-                    contrastive_loss = contrastive_loss.detach()
+                # if not grad_enabled:
+                #     loss_G = loss_G.detach()
+                #     loss_D = loss_D.detach()
+                #     cls_loss = cls_loss.detach()
+                #     contrastive_loss = contrastive_loss.detach()
 
                 LOGGER.info(
                     "[GRADS] adv=%.6e | cycle=%.6e | identity=%.6e | cls=%.6e | con=%.6e || "
@@ -2309,7 +2283,7 @@ def train(args: argparse.Namespace) -> None:
             device=device,
             mean=mean,
             std=std,
-            feature_extractor=feature_extractor,
+            feature_extractor=feature_extractor_model,
             abmil=abmil,
             slide_classifier=slide_classifier,
             projector=projector,
@@ -2324,7 +2298,7 @@ def train(args: argparse.Namespace) -> None:
             device=device,
             mean=mean,
             std=std,
-            feature_extractor=feature_extractor,
+            feature_extractor=feature_extractor_model,
             abmil=abmil,
             slide_classifier=slide_classifier,
             projector=projector,
