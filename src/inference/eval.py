@@ -14,8 +14,8 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm.auto import tqdm
 from torchvision.utils import save_image
 
-DEFAULT_OUTPUT_DIR = Path("outputs/evaluation")
 
+#device selection
 def _default_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -42,7 +42,6 @@ def load_generator(checkpoint_path: Path, device: torch.device) -> UNetGenerator
 def generate_images(
     generator,
     selected_paths,
-    output_dir,
     patch_size,
     device,
 ):
@@ -54,7 +53,7 @@ def generate_images(
         T.Normalize([0.5] * 3, [0.5] * 3),
     ])
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+
     generator.eval()
     generated_images = []
 
@@ -73,9 +72,31 @@ def generate_images(
             # Move results off the GPU before accumulating them.
             generated_images.append(generated.cpu())
         
+        if not generated_images:
+            return torch.empty((0, 3, patch_size, patch_size))
+        
         return torch.cat(generated_images, dim=0)
 
 
+#function to load real images
+
+def load_real_images(selected_paths, patch_size):
+    transform = T.Compose([
+        T.Resize(patch_size),
+        T.CenterCrop(patch_size),
+        T.ToTensor(),
+    ])
+
+    images = []
+
+    for image_path in selected_paths:
+        with Image.open(image_path) as image:
+            images.append(transform(image.convert("RGB")))
+
+    if not images:
+        return torch.empty((0, 3, patch_size, patch_size))
+
+    return torch.stack(images)
 
     
 
@@ -102,9 +123,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-selection", type=str, default=None, help = '''Select model type to evaluate. 
                         Options: 'CycleGAN-Baseline' or 'CycleGAN-WLoss' or 'Aug-CycleGAN' ''')
     
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Path to a single CycleGAN H2R checkpoint.")
+    parser.add_argument("--checkpoint", type=Path, default=None, required=True, help="Path to a single CycleGAN H2R checkpoint.")
 
-    parser.add_argument("--output-dir", type=Path, default= DEFAULT_OUTPUT_DIR)
 
     parser.add_argument("--patch-size", type=int, default=512)
 
@@ -162,16 +182,23 @@ def main():
         device=device,
     )
 
+    real_images = load_real_images(
+    selected_paths=selected_ret_paths,
+    patch_size=args.patch_size,
+    )
+
     print(f"Generated {len(generated_images)} images")
+    print(f"Loaded {len(real_images)} real images")
 
     #code to select metric and compute score
     metric_fn = select_metric(args.metric)
 
     score = metric_fn(
-        real_dir=args.output_dir / "real",
-        generated_dir=args.output_dir / "generated",
+        real_images=real_images,
+        generated_images=generated_images,
         device=device,
     )
+
 
     print(f"{args.metric.upper()}: {score}")
 
