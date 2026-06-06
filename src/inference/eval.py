@@ -9,10 +9,82 @@ import json
 import random
 import logging
 
+from torchvision import transforms as T
+from torchmetrics.image.fid import FrechetInceptionDistance
+from tqdm.auto import tqdm
+from torchvision.utils import save_image
 
 #code to call generator
 from src.models.Backbone_model.CycleGANv3 import UNetGenerator
 
+def load_generator(checkpoint_path: Path, device: torch.device) -> UNetGenerator:
+    generator = UNetGenerator().to(device)
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    if "G_H2R" in ckpt:
+        state = ckpt["G_H2R"]
+    elif "state_dict" in ckpt:
+        state = ckpt["state_dict"]
+    else:
+        state = ckpt        # This is there because train_cycegan.py and train_aug_cyclegan.py
+                            # save checkpoints in different formats. This is to ensure compatibility with both.
+    generator.load_state_dict(state)
+    logging.info("Loaded generator checkpoint %s", checkpoint_path)
+    return generator
+
+
+#code to generate images
+    
+def generate_images(
+    generator,
+    selected_paths,
+    output_dir,
+    patch_size,
+    device,
+):
+        
+    transform = T.Compose([
+        T.Resize(patch_size),
+        T.CenterCrop(patch_size),
+        T.ToTensor(),
+        T.Normalize([0.5] * 3, [0.5] * 3),
+    ])
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generator.eval()
+    generated_paths = []
+
+    with torch.no_grad():
+        for index, image_path in enumerate(selected_paths):
+            with Image.open(image_path) as image:
+                image = image.convert("RGB")
+                input_tensor = transform(image).unsqueeze(0).to(device)
+
+            generated = generator(input_tensor)
+
+            # Convert generator output from [-1, 1] to [0, 1].
+            generated = (generated * 0.5 + 0.5).clamp(0, 1)
+
+            output_path = output_dir / f"{index:05d}_{image_path.stem}.png"
+            save_image(generated, output_path)
+            generated_paths.append(output_path)
+
+    return generated_paths
+    
+
+#code to select evaluation metric
+
+def select_metric(metric_name: str):
+    name = metric_name.upper()
+
+    if name == "FID":
+        from src.inference.metrics.FID import evaluate
+    elif name == "KID":
+        from src.inference.metrics.KID import evaluate
+    else:
+        raise ValueError(f"Unsupported metric: {metric_name}")
+
+    return evaluate
+    
 #parser arguments
 
 def parse_args() -> argparse.Namespace:
@@ -43,19 +115,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_generator(checkpoint_path: Path, device: torch.device) -> UNetGenerator:
-    generator = UNetGenerator().to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    if "G_H2R" in ckpt:
-        state = ckpt["G_H2R"]
-    elif "state_dict" in ckpt:
-        state = ckpt["state_dict"]
-    else:
-        state = ckpt        # This is there because train_cycegan.py and train_aug_cyclegan.py
-                            # save checkpoints in different formats. This is to ensure compatibility with both.
-    generator.load_state_dict(state)
-    logging.info("Loaded generator checkpoint %s", checkpoint_path)
-    return generator
+
+
+
+
+
+
+
+
+
+
 
 def main():
 
@@ -76,11 +145,21 @@ def main():
     rng = random.Random(args.seed)
     selected_paths = rng.sample(he_paths, min(args.num_images, len(he_paths)))
 
-    #code to generate images
+
     
+    metric_fn = select_metric(args.metric)
+
+    score = metric_fn(
+        real_dir=args.output_dir / "real",
+        generated_dir=args.output_dir / "generated",
+        device=device,
+    )
+
+    print(f"{args.metric.upper()}: {score}")
 
 
-    #code to select evaluation metric
+
+
 
 
 

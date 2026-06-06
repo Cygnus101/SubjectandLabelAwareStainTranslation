@@ -26,7 +26,6 @@ from torchvision import transforms as T
 from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm.auto import tqdm
 
-from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_ROOT = SCRIPT_DIR.parent
