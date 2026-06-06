@@ -14,7 +14,7 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm.auto import tqdm
 from torchvision.utils import save_image
 
-#code to call generator
+#function to call generator
 from src.models.Backbone_model.CycleGANv3 import UNetGenerator
 
 def load_generator(checkpoint_path: Path, device: torch.device) -> UNetGenerator:
@@ -32,7 +32,7 @@ def load_generator(checkpoint_path: Path, device: torch.device) -> UNetGenerator
     return generator
 
 
-#code to generate images
+#function to generate images
     
 def generate_images(
     generator,
@@ -71,7 +71,7 @@ def generate_images(
     return generated_paths
     
 
-#code to select evaluation metric
+#function to select evaluation metric
 
 def select_metric(metric_name: str):
     name = metric_name.upper()
@@ -116,16 +116,6 @@ def parse_args() -> argparse.Namespace:
 
 
 
-
-
-
-
-
-
-
-
-
-
 def main():
 
     args = parse_args()
@@ -145,8 +135,20 @@ def main():
     rng = random.Random(args.seed)
     selected_paths = rng.sample(he_paths, min(args.num_images, len(he_paths)))
 
+    #code to load generator and generate images
+    generator = load_generator(args.checkpoint, device)
 
-    
+    generated_paths = generate_images(
+        generator=generator,
+        selected_paths=selected_paths,
+        output_dir=args.output_dir / "generated",
+        patch_size=args.patch_size,
+        device=device,
+    )
+
+    print(f"Generated {len(generated_paths)} images")
+
+    #code to select metric and compute score
     metric_fn = select_metric(args.metric)
 
     score = metric_fn(
@@ -157,13 +159,11 @@ def main():
 
     print(f"{args.metric.upper()}: {score}")
 
+if __name__ == "__main__":
 
-
-
-
-
-
-    #code to evaluate images and return score
+    logging.basicConfig(level=logging.INFO)
+    
+    main()
 
 
 
