@@ -14,6 +14,11 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm.auto import tqdm
 from torchvision.utils import save_image
 
+DEFAULT_OUTPUT_DIR = Path("outputs/evaluation")
+
+def _default_device():
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
 #function to call generator
 from src.models.Backbone_model.CycleGANv3 import UNetGenerator
 
@@ -51,7 +56,8 @@ def generate_images(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     generator.eval()
-    generated_paths = []
+    generated_images = []
+
 
     with torch.no_grad():
         for index, image_path in enumerate(selected_paths):
@@ -64,11 +70,13 @@ def generate_images(
             # Convert generator output from [-1, 1] to [0, 1].
             generated = (generated * 0.5 + 0.5).clamp(0, 1)
 
-            output_path = output_dir / f"{index:05d}_{image_path.stem}.png"
-            save_image(generated, output_path)
-            generated_paths.append(output_path)
+            # Move results off the GPU before accumulating them.
+            generated_images.append(generated.cpu())
+        
+        return torch.cat(generated_images, dim=0)
 
-    return generated_paths
+
+
     
 
 #function to select evaluation metric
@@ -104,13 +112,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--device", type=str, default=_default_device())
 
-    parser.add_argument("--split", type=Path, default=None, help="Split json generated from build_augmented_dataset.py")\
+    parser.add_argument("--split", type=Path, required=True, default=None, help="Split json generated from build_augmented_dataset.py")\
     
     parser.add_argument("--num-images", type=int, default=1000, help="Number of random images to evaluate on.")
 
     parser.add_argument("--metric", type=str, default="FID", help="Evaluation metric to use. Options: 'FID' or 'KID'.")
 
-    parser.add_argument("--slide", type=Path, default=4, help="Slide json generated from build_augmented_dataset.py")    
+    parser.add_argument("--slide", type=Path,  type=Path, required=True, help="Slide json generated from build_augmented_dataset.py")    
 
     return parser.parse_args()
 
@@ -133,21 +141,28 @@ def main():
         for patch in slide["he_patches"]
     ]
 
+    ret_paths = [
+        Path(patch["patch_path"])
+        for slide in test_slides
+        for patch in slide["ret_patches"]
+    ]
+
     rng = random.Random(args.seed)
+
     selected_paths = rng.sample(he_paths, min(args.num_images, len(he_paths)))
+    selected_ret_paths = rng.sample(ret_paths, min(args.num_images, len(ret_paths)))
 
     #code to load generator and generate images
     generator = load_generator(args.checkpoint, device)
 
-    generated_paths = generate_images(
+    generated_images = generate_images(
         generator=generator,
         selected_paths=selected_paths,
-        output_dir=args.output_dir / "generated",
         patch_size=args.patch_size,
         device=device,
     )
 
-    print(f"Generated {len(generated_paths)} images")
+    print(f"Generated {len(generated_images)} images")
 
     #code to select metric and compute score
     metric_fn = select_metric(args.metric)
