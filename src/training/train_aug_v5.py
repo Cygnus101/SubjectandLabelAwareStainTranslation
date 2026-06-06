@@ -1949,6 +1949,8 @@ def train(args: argparse.Namespace) -> None:
         "Proj": projector,
         "D_R": D_R,
         "D_H": D_H,
+        "ABMIL": abmil,
+        "SlideClassifier": slide_classifier,
     }
     optimizer_states = {
         "opt_G": optimizer_G if grad_enabled else None,

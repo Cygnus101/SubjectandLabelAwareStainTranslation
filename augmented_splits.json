@@ -272,24 +272,5 @@
     206,
     257,
     260
-  ],
-  "val_indices_indices": [
-    255,
-    259
-  ],
-  "train_indices_indices": [
-    256,
-    258,
-    261,
-    262,
-    263,
-    264,
-    265,
-    266,
-    267
-  ],
-  "test_indices_indices": [
-    257,
-    260
   ]
 }
