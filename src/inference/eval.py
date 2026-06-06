@@ -14,12 +14,25 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm.auto import tqdm
 from torchvision.utils import save_image
 
+#path resolution
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+def resolve_patch_path(raw, data_root=None):
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path
+    return ((data_root or PROJECT_ROOT) / path).resolve()
+
 
 #device selection
+
 def _default_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
+
 #function to call generator
+
 from src.models.Backbone_model.CycleGANv3 import UNetGenerator
 
 def load_generator(checkpoint_path: Path, device: torch.device) -> UNetGenerator:
@@ -125,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument("--checkpoint", type=Path, default=None, required=True, help="Path to a single CycleGAN H2R checkpoint.")
 
+    parser.add_argument("--data-root", type=Path, default=None)
 
     parser.add_argument("--patch-size", type=int, default=512)
 
@@ -132,13 +146,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--device", type=str, default=_default_device())
 
-    parser.add_argument("--split", type=Path, required=True, default=None, help="Split json generated from build_augmented_dataset.py")\
+    parser.add_argument("--split", type=Path, required=True,  help="Split json generated from build_augmented_dataset.py")\
     
     parser.add_argument("--num-images", type=int, default=1000, help="Number of random images to evaluate on.")
 
-    parser.add_argument("--metric", type=str, default="FID", help="Evaluation metric to use. Options: 'FID' or 'KID'.")
+    parser.add_argument( "--metric",type=str.upper,choices=["FID", "KID"],default="FID", help="Evaluation metric to compute. Options: 'FID' or 'KID'. Default is 'FID'.")
 
-    parser.add_argument("--slide", type=Path,  type=Path, required=True, help="Slide json generated from build_augmented_dataset.py")    
+    parser.add_argument("--slide", type=Path, required=True, help="Slide json generated from build_augmented_dataset.py")    
 
     return parser.parse_args()
 
@@ -156,13 +170,13 @@ def main():
     test_slides = [slides[i] for i in splits["test_indices"]]
 
     he_paths = [
-        Path(patch["patch_path"])
+        Path(patch["patch_path"], args.data_root)
         for slide in test_slides
         for patch in slide["he_patches"]
     ]
 
     ret_paths = [
-        Path(patch["patch_path"])
+        Path(patch["patch_path"], args.data_root)
         for slide in test_slides
         for patch in slide["ret_patches"]
     ]
@@ -172,6 +186,9 @@ def main():
     selected_paths = rng.sample(he_paths, min(args.num_images, len(he_paths)))
     selected_ret_paths = rng.sample(ret_paths, min(args.num_images, len(ret_paths)))
 
+    if not selected_paths or not selected_ret_paths:
+        raise RuntimeError("No H&E or Reticulin test images were found.")
+    
     #code to load generator and generate images
     generator = load_generator(args.checkpoint, device)
 
