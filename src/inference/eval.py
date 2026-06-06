@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="Evaluate Model by computing score from random images.")
 
-    parser.add_argument("--model-selection", type=Path, default=None, help = '''Select model type to evaluate. 
+    parser.add_argument("--model-selection", type=str, default=None, help = '''Select model type to evaluate. 
                         Options: 'CycleGAN-Baseline' or 'CycleGAN-WLoss' or 'Aug-CycleGAN' ''')
     
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to a single CycleGAN H2R checkpoint.")
@@ -104,13 +104,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--device", type=str, default=_default_device())
 
-    parser.add_argument("--split", type=str, default=None, help="Split json generated from build_augmented_dataset.py")\
+    parser.add_argument("--split", type=Path, default=None, help="Split json generated from build_augmented_dataset.py")\
     
-    parser.add_argument("--num-samples", type=int, default=1000, help="Number of random samples to evaluate on.")
+    parser.add_argument("--num-images", type=int, default=1000, help="Number of random images to evaluate on.")
 
     parser.add_argument("--metric", type=str, default="FID", help="Evaluation metric to use. Options: 'FID' or 'KID'.")
 
-    parser.add_argument("--slide", type=int, default=4, help="Slide json generated from build_augmented_dataset.py")    
+    parser.add_argument("--slide", type=Path, default=4, help="Slide json generated from build_augmented_dataset.py")    
 
     return parser.parse_args()
 
@@ -119,6 +119,7 @@ def parse_args() -> argparse.Namespace:
 def main():
 
     args = parse_args()
+    device = torch.device(args.device)
 
     #code to select random images from dataset
     splits = json.loads(args.split.read_text())
@@ -162,7 +163,7 @@ def main():
 if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
-    
+
     main()
 
 
